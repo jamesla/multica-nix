@@ -38,10 +38,11 @@
       nixosModules.multica = import ./modules/multica.nix;
       nixosModules.default = self.nixosModules.multica;
 
-      # `nix flake check` builds the CLI and runs the integration VM test (Linux only).
+      # `nix flake check` builds the CLI and runs the VM tests (Linux only).
       checks = forLinux ({ pkgs, system, ... }: {
         multica-cli = self.packages.${system}.multica-cli;
         integration = import ./tests/integration.nix { inherit pkgs self; };
+        prune = import ./tests/prune.nix { inherit pkgs self; };
       });
 
       devShells = forAllSystems ({ pkgs, ... }: {

@@ -114,9 +114,14 @@ is world-readable.
 ## Declarative skills
 
 Declare skills as an attribute set keyed by name — the attribute name *is* the skill's
-identity. On rebuild a `multica-skills` service reconciles them into the workspace: declared
-skills are created or updated to match; skills you remove are left untouched (reconciliation
-is **additive**, so it never deletes).
+identity. On rebuild the `multica-reconcile` service reconciles them into the workspace with
+**full ownership**: declared skills are created or updated; any skill *not* declared here is
+**deleted** from the workspace. The workspace is treated as exclusively managed by this config.
+
+> **⚠️ Breaking change from the previous additive behaviour.** Any skill (or agent, squad,
+> quick action, or autopilot) that exists in the workspace but is not declared in this config
+> will be deleted on the next rebuild. If you have resources created in the UI or CLI that
+> you want to keep, add them to the config first.
 
 ```nix
 services.multica.skills = {
@@ -155,9 +160,12 @@ If the identity can see more than one workspace, set `services.multica.workspace
 ## Declarative agents and squads
 
 Agents and squads reconcile the same way, in order **skills → agents → squads** (so an agent
-can reference skills you declare, and a squad can reference agents you declare). The resources
-are **additive** (declaring creates/updates; removing never deletes), but their relationships —
-an agent's assigned skills, a squad's members — are **replaced to match** the config.
+can reference skills you declare, and a squad can reference agents you declare). The workspace
+is **fully owned** by this config: declared resources are created or updated; agents and squads
+not declared are **archived** on the next rebuild. An agent's assigned skills and a squad's
+members are **replaced to match** the declared set. Archived agents are restored (not duplicated)
+if re-declared. Archived squads have no CLI restore; re-declaring an archived squad name creates
+a new one.
 
 ```nix
 services.multica.agents.reviewer = {
@@ -272,6 +280,5 @@ first run on a new architecture prints the hash to paste into `imageSha`.
 
 ## Roadmap
 
-- Optional: prune-on-removal for skills (make reconciliation fully declarative), per-skill
-  change detection to skip unchanged updates.
+- Optional: per-skill change detection to skip unchanged updates.
 - Optional: build backend/web from source, home-manager module for the CLI, hardened networking.

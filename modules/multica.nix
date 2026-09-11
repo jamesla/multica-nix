@@ -97,10 +97,12 @@ let
       cfg.autopilots;
   };
 
-  # Additive reconciler: create/update declared skills, agents and squads to match;
-  # never delete the resources themselves. Relationships (an agent's skills, a squad's
-  # members) are replaced to match. Auth is a mul_… PAT in MULTICA_TOKEN or, in dev
-  # mode, an auto session; without either we skip rather than fail the rebuild.
+  # Declarative reconciler: the workspace is fully owned by this config.
+  # Declared resources are created/updated to match; anything in the workspace NOT
+  # declared is deleted (skills/autopilots: hard-deleted; agents/squads: archived).
+  # An agent's skill assignments and a squad's members are also replaced to match.
+  # Auth is a mul_… PAT in MULTICA_TOKEN or, in dev mode, an auto session; without
+  # either we skip rather than fail the rebuild.
   reconcile = pkgs.writeShellApplication {
     name = "multica-reconcile";
     runtimeInputs = [ cfg.package pkgs.jq pkgs.curl pkgs.coreutils ];
@@ -262,8 +264,19 @@ let
           echo "multica-reconcile: updating agent $name ($id)"
           multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
         else
-          echo "multica-reconcile: creating agent $name"
-          id=$(multica agent create --name "$name" --runtime-id "$rtid" "''${args[@]}" --output json | jq -r '.id')
+          # Check if an archived agent with this name exists and restore it rather than
+          # creating a duplicate (agents are soft-deleted via archive, not hard-deleted).
+          all_agents=$(multica agent list --include-archived --output json)
+          archived_id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$all_agents")
+          if [ -n "$archived_id" ]; then
+            echo "multica-reconcile: restoring archived agent $name ($archived_id)"
+            multica agent restore "$archived_id" >/dev/null
+            id="$archived_id"
+            multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
+          else
+            echo "multica-reconcile: creating agent $name"
+            id=$(multica agent create --name "$name" --runtime-id "$rtid" "''${args[@]}" --output json | jq -r '.id')
+          fi
         fi
 
         # Skill assignments: replace to match the declared set (empty clears).
@@ -435,7 +448,7 @@ let
             [ -n "$status" ] && multica autopilot update "$id" --status "$status" >/dev/null
           fi
 
-          # Schedule triggers: upsert by label; never delete undeclared ones.
+          # Schedule triggers: upsert by label; delete triggers not declared (full ownership).
           existing_triggers=$(multica autopilot trigger-list "$id" --output json | jq '.triggers // .')
           jq -c '.triggers[]' <<<"$ap" | while read -r tr; do
             label=$(jq -r '.label' <<<"$tr")
@@ -461,8 +474,72 @@ let
               fi
             fi
           done
+
+          # Prune triggers not in the declared set (full ownership of triggers too).
+          want_labels=$(jq -r '.triggers[].label' <<<"$ap")
+          while IFS=$'\t' read -r tid tlabel; do
+            [ -n "$tid" ] || continue
+            if printf '%s\n' "$want_labels" | grep -Fxq -- "$tlabel"; then continue; fi
+            echo "multica-reconcile: pruning autopilot $title trigger $tlabel ($tid)"
+            multica autopilot trigger-delete "$id" "$tid" >/dev/null \
+              || echo "multica-reconcile: prune of trigger $tlabel failed" >&2
+          done < <(jq -r '.[] | [.id, .label] | @tsv' <<<"$existing_triggers")
         done
       fi
+
+      # ---- prune: full ownership of the workspace ----------------------------
+      # Delete anything present in the workspace that is NOT declared in the manifest.
+      # This makes reconciliation fully declarative: the workspace exactly matches the
+      # config. Dependent resources are pruned first so each delete hits an unreferenced
+      # object. Agents and squads are soft-deleted (archived); skills and autopilots are
+      # hard-deleted. Failures are logged but don't abort the rebuild — they'll retry on
+      # the next config change.
+      #
+      # WARNING: resources created in the Multica UI or CLI that are NOT in this config
+      # will be deleted. This workspace must be managed exclusively by this config.
+      prune_kind() {
+        # $1 = identity field (name or title)
+        # $2 = live JSON array (already fetched)
+        # $3 = manifest key (skills, agents, squads, quickActions, autopilots)
+        # $4 = shell function to call with the resource id
+        local idfield="$1" live="$2" key="$3" delfn="$4"
+        local want
+        want=$(jq -r --arg k "$key" --arg f "$idfield" '.[$k][]? | .[$f]' "$manifest")
+        while IFS=$'\t' read -r rid ident; do
+          [ -n "$rid" ] || continue
+          if printf '%s\n' "$want" | grep -Fxq -- "$ident"; then continue; fi
+          echo "multica-reconcile: pruning $key '$ident' ($rid)"
+          "$delfn" "$rid" \
+            || echo "multica-reconcile: prune of $key '$ident' failed; will retry on next change" >&2
+        done < <(jq -r --arg f "$idfield" '.[] | [.id, .[$f]] | @tsv' <<<"$live")
+      }
+
+      del_ap()    { multica autopilot delete "$1" >/dev/null; }
+      del_qa()    { curl -fsS -X DELETE \
+                      -H "Authorization: Bearer $MULTICA_TOKEN" \
+                      -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
+                      "$MULTICA_SERVER_URL/api/quick-actions/$1" >/dev/null; }
+      del_squad() { multica squad delete "$1" >/dev/null; }
+      del_agent() { multica agent archive "$1" >/dev/null; }
+      del_skill() { multica skill delete "$1" --yes >/dev/null; }
+
+      # Fetch fresh live lists post-apply so newly-created resources are never pruned.
+      live_aps=$(multica autopilot list --output json | jq '.autopilots // .')
+      live_qas=$(curl -fsS \
+        -H "Authorization: Bearer $MULTICA_TOKEN" \
+        -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
+        "$MULTICA_SERVER_URL/api/quick-actions" | jq '.quick_actions // []')
+      live_squads=$(multica squad list --output json)
+      live_agents=$(multica agent list --output json)
+      live_skills=$(multica skill list --output json)
+
+      prune_kind title "$live_aps"    autopilots   del_ap
+      prune_kind name  "$live_qas"    quickActions del_qa
+      prune_kind name  "$live_squads" squads       del_squad
+      prune_kind name  "$live_agents" agents       del_agent
+      prune_kind name  "$live_skills" skills       del_skill
+
+      echo "multica-reconcile: reconcile complete"
     '';
   };
 in
@@ -616,10 +693,10 @@ in
     skills = lib.mkOption {
       default = { };
       description = ''
-        Declarative Multica skills, reconciled into the workspace on rebuild. The
-        attribute name is the skill's name (its identity). Reconciliation is
-        additive: declared skills are created or updated to match; skills removed
-        from this set are left untouched in the workspace.
+        Declarative Multica skills. The attribute name is the skill's name (its
+        identity). The workspace is fully owned by this config: declared skills are
+        created or updated to match; skills not declared here are **deleted** from
+        the workspace on the next rebuild.
 
         Requires a personal access token (`mul_…`) in `environmentFile` as
         `MULTICA_TOKEN`; without it, reconciliation is skipped.
@@ -683,8 +760,10 @@ in
       default = { };
       description = ''
         Declarative Multica agents, reconciled into the workspace on rebuild (after
-        skills). The attribute name is the agent's name. Additive: declared agents are
-        created or updated; agents removed from this set are left untouched.
+        skills). The attribute name is the agent's name. The workspace is fully owned
+        by this config: declared agents are created or updated; agents not declared
+        here are **archived** from the workspace on the next rebuild. Archived agents
+        can be re-declared (they are restored rather than duplicated).
 
         Agents need a runtime, which is registered by a running `multica daemon` (not
         declarative). Reference one with `runtime`; if the workspace has exactly one,
@@ -783,8 +862,13 @@ in
       default = { };
       description = ''
         Declarative Multica squads, reconciled after agents. The attribute name is the
-        squad's name. Additive for the squad itself; members are replaced to match.
-        The leader is automatically a member — do not list it under `members`.
+        squad's name. The workspace is fully owned by this config: declared squads are
+        created or updated; squads not declared here are **archived** on the next
+        rebuild. Members are replaced to match the declared set. The leader is
+        automatically a member — do not list it under `members`.
+
+        Note: archived squads cannot be restored via the CLI; re-declaring an archived
+        squad name creates a new squad with the same name.
       '';
       example = lib.literalExpression ''
         {
@@ -831,7 +915,8 @@ in
       description = ''
         Declarative Multica quick actions — named prompts that dispatch to an agent or
         squad. Reconciled after agents/squads (so they can reference ones you declare).
-        Additive: declared actions are created or updated; removing one leaves it be.
+        The workspace is fully owned by this config: declared actions are created or
+        updated; quick actions not declared here are **deleted** on the next rebuild.
 
         Quick actions have no CLI, so the reconciler drives the REST API directly.
       '';
@@ -880,16 +965,17 @@ in
       description = ''
         Declarative Multica autopilots — scheduled/triggered agent automations.
         Reconciled after agents/squads (so they can reference agents you declare).
-        The attribute name is the autopilot's title (its identity). Additive:
-        declared autopilots are created or updated; removing one leaves it be.
+        The attribute name is the autopilot's title (its identity). The workspace is
+        fully owned by this config: declared autopilots are created or updated;
+        autopilots not declared here are **deleted** on the next rebuild.
 
         Each autopilot dispatches to an assignee `agent`, which needs a runtime
         (registered by a running `multica daemon`). Without the agent present,
         the autopilot is skipped, just like quick actions.
 
         Only schedule (cron) triggers are declarative here; webhook triggers are
-        managed manually with `multica autopilot trigger-add`. Declared triggers
-        are upserted by label; triggers added elsewhere are left untouched.
+        managed manually with `multica autopilot trigger-add`. Declared triggers are
+        upserted by label; triggers not declared are **deleted** (full ownership).
       '';
       example = lib.literalExpression ''
         {
@@ -1080,27 +1166,27 @@ in
         })
         cfg.autopilots;
 
-    # Reconcile declarative skills, agents and squads once the backend is up.
-    # restartTriggers ties re-runs to the manifest, so a rebuild only re-applies
-    # when something in the declared set changes.
-    systemd.services.multica-reconcile =
-      lib.mkIf (cfg.skills != { } || cfg.agents != { } || cfg.squads != { } || cfg.quickActions != { } || cfg.autopilots != { }) {
-        description = "Reconcile declarative Multica skills, agents and squads";
-        after = [ "docker-multica-backend.service" ];
-        requires = [ "docker-multica-backend.service" ];
-        wantedBy = [ "multi-user.target" ];
-        restartTriggers = [ reconcileManifest ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          EnvironmentFile = cfg.environmentFile;
-          StateDirectory = "multica-reconcile";
-          Environment = [
-            "HOME=%S/multica-reconcile"
-            "MULTICA_SERVER_URL=${backendUrl}"
-          ] ++ lib.optional (cfg.workspaceId != null) "MULTICA_WORKSPACE_ID=${cfg.workspaceId}";
-        };
-        script = "${lib.getExe reconcile} ${reconcileManifest}";
+    # Reconcile declared resources and prune undeclared ones once the backend is up.
+    # Always defined (not gated on non-empty sets) so that removing the last declared
+    # resource still triggers a reconcile that can prune it from the workspace.
+    # restartTriggers ensures re-runs only when the declared set actually changes.
+    systemd.services.multica-reconcile = {
+      description = "Reconcile declarative Multica resources (prunes undeclared ones)";
+      after = [ "docker-multica-backend.service" ];
+      requires = [ "docker-multica-backend.service" ];
+      wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ reconcileManifest ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        EnvironmentFile = cfg.environmentFile;
+        StateDirectory = "multica-reconcile";
+        Environment = [
+          "HOME=%S/multica-reconcile"
+          "MULTICA_SERVER_URL=${backendUrl}"
+        ] ++ lib.optional (cfg.workspaceId != null) "MULTICA_WORKSPACE_ID=${cfg.workspaceId}";
       };
+      script = "${lib.getExe reconcile} ${reconcileManifest}";
+    };
   };
 }
