@@ -85,6 +85,16 @@ let
         inherit (qa) description prompt assignee assigneeType visibility;
       })
       cfg.quickActions;
+
+    autopilots = lib.mapAttrsToList
+      (title: ap: {
+        inherit title;
+        inherit (ap) description agent mode project issueTitleTemplate subscribers status;
+        triggers = lib.mapAttrsToList
+          (label: t: { inherit label; inherit (t) cron timezone enabled; })
+          ap.triggers;
+      })
+      cfg.autopilots;
   };
 
   # Additive reconciler: create/update declared skills, agents and squads to match;
@@ -378,6 +388,79 @@ let
               -H 'Content-Type: application/json' \
               -d "$body" "$MULTICA_SERVER_URL/api/quick-actions" >/dev/null
           fi
+        done
+      fi
+
+      # ---- autopilots (need an assignee agent) -----------------------------
+      # Scheduled/triggered agent automations. Reconciled after agents/squads so
+      # they can reference declared agents. Additive: create/update declared ones,
+      # never delete. Only schedule triggers are managed here, upserted by label.
+      want_ap=$(jq '.autopilots | length' "$manifest")
+      if [ "$want_ap" != "0" ]; then
+        ap_agents=$(multica agent list --output json)
+        ap_existing=$(multica autopilot list --output json | jq '.autopilots // .')
+
+        jq -c '.autopilots[]' "$manifest" | while read -r ap; do
+          title=$(jq -r '.title' <<<"$ap")
+          description=$(jq -r '.description' <<<"$ap")
+          agent=$(jq -r '.agent' <<<"$ap")
+          mode=$(jq -r '.mode' <<<"$ap")
+          project=$(jq -r '.project // empty' <<<"$ap")
+          tmpl=$(jq -r '.issueTitleTemplate // empty' <<<"$ap")
+          status=$(jq -r '.status // empty' <<<"$ap")
+
+          aid=$(jq -r --arg a "$agent" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$ap_agents")
+          if [ -z "$aid" ]; then
+            echo "multica-reconcile: autopilot $title agent '$agent' not found; skipping." >&2
+            continue
+          fi
+
+          args=(--description "$description" --agent "$aid" --mode "$mode")
+          [ -n "$project" ] && args+=(--project "$project")
+          [ -n "$tmpl" ] && args+=(--issue-title-template "$tmpl")
+          while read -r sub; do
+            [ -n "$sub" ] && args+=(--subscriber "$sub")
+          done < <(jq -r '.subscribers[]?' <<<"$ap")
+
+          id=$(jq -r --arg t "$title" 'map(select(.title == $t)) | (.[0].id // empty)' <<<"$ap_existing")
+          if [ -n "$id" ]; then
+            echo "multica-reconcile: updating autopilot $title ($id)"
+            uargs=("''${args[@]}")
+            [ -n "$status" ] && uargs+=(--status "$status")
+            multica autopilot update "$id" --title "$title" "''${uargs[@]}" >/dev/null
+          else
+            echo "multica-reconcile: creating autopilot $title"
+            id=$(multica autopilot create --title "$title" "''${args[@]}" --output json | jq -r '.id')
+            # --status is update-only; apply it after create when requested.
+            [ -n "$status" ] && multica autopilot update "$id" --status "$status" >/dev/null
+          fi
+
+          # Schedule triggers: upsert by label; never delete undeclared ones.
+          existing_triggers=$(multica autopilot trigger-list "$id" --output json | jq '.triggers // .')
+          jq -c '.triggers[]' <<<"$ap" | while read -r tr; do
+            label=$(jq -r '.label' <<<"$tr")
+            cron=$(jq -r '.cron' <<<"$tr")
+            tz=$(jq -r '.timezone' <<<"$tr")
+            enabled=$(jq -r '.enabled' <<<"$tr")
+            if [ "$enabled" = "true" ]; then eflag=--enabled; else eflag=--enabled=false; fi
+
+            tid=$(jq -r --arg l "$label" 'map(select(.label == $l)) | (.[0].id // empty)' <<<"$existing_triggers")
+            if [ -n "$tid" ]; then
+              echo "multica-reconcile: updating autopilot $title trigger $label"
+              multica autopilot trigger-update "$id" "$tid" \
+                --cron "$cron" --timezone "$tz" --label "$label" "$eflag" >/dev/null
+            else
+              echo "multica-reconcile: adding autopilot $title trigger $label"
+              multica autopilot trigger-add "$id" --kind schedule \
+                --cron "$cron" --timezone "$tz" --label "$label" >/dev/null
+              # trigger-add always enables; disable in a follow-up when requested.
+              if [ "$enabled" != "true" ]; then
+                tid=$(multica autopilot trigger-list "$id" --output json \
+                  | jq -r --arg l "$label" '(.triggers // .) | map(select(.label == $l)) | (.[0].id // empty)')
+                [ -n "$tid" ] && multica autopilot trigger-update "$id" "$tid" --enabled=false >/dev/null
+              fi
+            fi
+          done
         done
       fi
     '';
@@ -791,6 +874,106 @@ in
         };
       }));
     };
+
+    autopilots = lib.mkOption {
+      default = { };
+      description = ''
+        Declarative Multica autopilots — scheduled/triggered agent automations.
+        Reconciled after agents/squads (so they can reference agents you declare).
+        The attribute name is the autopilot's title (its identity). Additive:
+        declared autopilots are created or updated; removing one leaves it be.
+
+        Each autopilot dispatches to an assignee `agent`, which needs a runtime
+        (registered by a running `multica daemon`). Without the agent present,
+        the autopilot is skipped, just like quick actions.
+
+        Only schedule (cron) triggers are declarative here; webhook triggers are
+        managed manually with `multica autopilot trigger-add`. Declared triggers
+        are upserted by label; triggers added elsewhere are left untouched.
+      '';
+      example = lib.literalExpression ''
+        {
+          "Nightly triage" = {
+            description = "Summarise and label new issues from the last day.";
+            agent = "reviewer";           # an agent name or id
+            mode = "create_issue";
+            issueTitleTemplate = "Triage {{date}}";
+            triggers.nightly = { cron = "0 9 * * *"; timezone = "Australia/Sydney"; };
+          };
+        }
+      '';
+      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+        options = {
+          description = lib.mkOption {
+            type = lib.types.lines;
+            description = "Autopilot description, used as the run prompt (required).";
+          };
+          agent = lib.mkOption {
+            type = lib.types.str;
+            description = "Assignee agent that runs the autopilot, by name or id (required).";
+          };
+          mode = lib.mkOption {
+            type = lib.types.enum [ "create_issue" "run_only" ];
+            default = "run_only";
+            description = ''
+              Execution mode: `run_only` just runs the agent; `create_issue` files an
+              issue for each run (see `issueTitleTemplate`).
+            '';
+          };
+          project = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Project id to associate runs/issues with. Null = none.";
+          };
+          issueTitleTemplate = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Title template for issues created in `create_issue` mode. Only `{{date}}`
+              (UTC, YYYY-MM-DD) is interpolated. Requires `mode = "create_issue"`.
+            '';
+          };
+          subscribers = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Members to notify for issues this autopilot creates, by name or user id.
+              The set is replaced to match on each reconcile.
+            '';
+          };
+          status = lib.mkOption {
+            type = lib.types.nullOr (lib.types.enum [ "active" "paused" ]);
+            default = null;
+            description = "Desired status. Null leaves the server default / current value.";
+          };
+          triggers = lib.mkOption {
+            default = { };
+            description = ''
+              Schedule (cron) triggers, keyed by label (the label is the identity).
+              Upserted on each reconcile; triggers not listed here are left untouched.
+            '';
+            type = lib.types.attrsOf (lib.types.submodule {
+              options = {
+                cron = lib.mkOption {
+                  type = lib.types.str;
+                  description = "Cron expression for the schedule (required).";
+                };
+                timezone = lib.mkOption {
+                  type = lib.types.str;
+                  default = "UTC";
+                  description = "IANA timezone the cron expression is evaluated in.";
+                };
+                enabled = lib.mkOption {
+                  type = lib.types.bool;
+                  default = true;
+                  description = "Whether the trigger is enabled.";
+                };
+              };
+            });
+          };
+        };
+      }));
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -889,13 +1072,19 @@ in
             message = ''services.multica.skills.${name}.files."${path}": set exactly one of `text` or `source`.'';
           })
           skill.files)
-        cfg.skills);
+        cfg.skills)
+      ++ lib.mapAttrsToList
+        (title: ap: {
+          assertion = ap.issueTitleTemplate == null || ap.mode == "create_issue";
+          message = ''services.multica.autopilots."${title}": `issueTitleTemplate` requires `mode = "create_issue"`.'';
+        })
+        cfg.autopilots;
 
     # Reconcile declarative skills, agents and squads once the backend is up.
     # restartTriggers ties re-runs to the manifest, so a rebuild only re-applies
     # when something in the declared set changes.
     systemd.services.multica-reconcile =
-      lib.mkIf (cfg.skills != { } || cfg.agents != { } || cfg.squads != { } || cfg.quickActions != { }) {
+      lib.mkIf (cfg.skills != { } || cfg.agents != { } || cfg.squads != { } || cfg.quickActions != { } || cfg.autopilots != { }) {
         description = "Reconcile declarative Multica skills, agents and squads";
         after = [ "docker-multica-backend.service" ];
         requires = [ "docker-multica-backend.service" ];

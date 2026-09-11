@@ -94,6 +94,7 @@ start, so it never falls back to Multica cloud. Just launch it and sign in with 
 | `services.multica.agents` | `{}` | Declarative agents (need a runtime; see below). |
 | `services.multica.squads` | `{}` | Declarative squads of agents (see below). |
 | `services.multica.quickActions` | `{}` | Declarative quick actions (named prompts → agent/squad). |
+| `services.multica.autopilots` | `{}` | Declarative autopilots (scheduled agent automations; see below). |
 | `services.multica.devMode` | `true` | Dev backend: passwordless login + automatic skill token. Set false for production. |
 | `services.multica.devLoginEmail` | `"admin@multica.local"` | Identity the reconciler logs in as in dev mode (log into the app with the same email). |
 | `services.multica.workspaceId` | `null` | Workspace to reconcile skills into (defaults to the sole workspace, auto-created in dev). |
@@ -216,6 +217,32 @@ requires the assignee agent to be public; the default `"private"` works with any
 
 Quick actions have no CLI, so the reconciler drives Multica's REST API directly — no extra setup
 beyond the token the reconciler already uses.
+
+## Declarative autopilots
+
+Autopilots are scheduled/triggered agent automations. They reconcile after agents/squads (so they
+can reference agents you declare), additively — the attribute name *is* the autopilot's title.
+
+```nix
+services.multica.autopilots."Nightly triage" = {
+  description = "Summarise and label new issues from the last day.";  # used as the run prompt
+  agent = "reviewer";                    # assignee agent, by name or id
+  mode = "create_issue";                 # or "run_only" (default)
+  issueTitleTemplate = "Triage {{date}}"; # create_issue only; only {{date}} is interpolated
+  # project = "…"; subscribers = [ "alice" ]; status = "active";  # all optional
+  triggers.nightly = {
+    cron = "0 9 * * *";
+    timezone = "Australia/Sydney";       # default "UTC"
+    # enabled = false;                   # default true
+  };
+};
+```
+
+Like quick actions, an autopilot dispatches to an `agent`, which needs a runtime — if the agent
+doesn't exist yet the reconciler logs a notice and skips the autopilot rather than failing the
+rebuild. Only **schedule (cron) triggers** are declarative here, keyed by label and upserted on
+each reconcile; triggers you remove (or webhook triggers added with `multica autopilot
+trigger-add`) are left untouched.
 
 ## Networking (round 1)
 

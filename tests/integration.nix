@@ -81,6 +81,11 @@ pkgs.testers.runNixOSTest {
         prompt = "Triage this issue.";
         assignee = "reviewer";
       };
+      autopilots.nightly = {
+        description = "Summarise open issues each night.";
+        agent = "reviewer";
+        triggers.nightly = { cron = "0 9 * * *"; };
+      };
     };
   };
 
@@ -148,6 +153,14 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "sudo -u postgres psql -d multica -tAc "
         "\"select count(*) from quick_action\" | grep -q '^0$'"
+    )
+
+    # Autopilots dispatch to an agent too, so with no runtime the reviewer agent
+    # doesn't exist and the reconciler skips the autopilot cleanly. The skip log
+    # proves creation was never attempted, so no autopilot could have been made.
+    machine.succeed(
+        "journalctl -u multica-reconcile.service "
+        "| grep -q \"autopilot nightly agent 'reviewer' not found\""
     )
   '';
 }
