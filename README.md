@@ -206,7 +206,9 @@ Non-secret bits (`instructions`, `model`, `runtimeConfig`, `customArgs`) are fin
 ## Declarative quick actions
 
 Quick actions are named prompts that dispatch to an agent or squad. They reconcile after
-agents/squads (so they can reference ones you declare), additively.
+agents/squads (so they can reference ones you declare). The workspace is fully owned by
+this config: declared actions are created or updated; quick actions not declared here are
+**deleted** on the next rebuild.
 
 ```nix
 services.multica.quickActions.triage = {
@@ -229,7 +231,9 @@ beyond the token the reconciler already uses.
 ## Declarative autopilots
 
 Autopilots are scheduled/triggered agent automations. They reconcile after agents/squads (so they
-can reference agents you declare), additively — the attribute name *is* the autopilot's title.
+can reference agents you declare) — the attribute name *is* the autopilot's title. The workspace
+is fully owned by this config: declared autopilots are created or updated; autopilots not declared
+here are **deleted** on the next rebuild.
 
 ```nix
 services.multica.autopilots."Nightly triage" = {
@@ -249,10 +253,10 @@ services.multica.autopilots."Nightly triage" = {
 Like quick actions, an autopilot dispatches to an `agent`, which needs a runtime — if the agent
 doesn't exist yet the reconciler logs a notice and skips the autopilot rather than failing the
 rebuild. Only **schedule (cron) triggers** are declarative here, keyed by label and upserted on
-each reconcile; triggers you remove (or webhook triggers added with `multica autopilot
-trigger-add`) are left untouched.
+each reconcile; triggers not declared here are **deleted**. Webhook triggers added with
+`multica autopilot trigger-add` are not managed here.
 
-## Networking (round 1)
+## Networking
 
 The backend container uses **host networking**, so it reaches native postgres over `localhost`.
 The backend port is therefore reachable on all interfaces at the OS level; the NixOS firewall

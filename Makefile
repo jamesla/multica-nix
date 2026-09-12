@@ -1,31 +1,26 @@
-# Friendly entrypoints over nix. Everything here just wraps a nix command.
 SYSTEM := $(shell nix eval --impure --raw --expr 'builtins.currentSystem')
 
-.PHONY: help build check test fmt fmt-check dev update-digests
+.PHONY: build check test fmt fmt-check dev update-digests
 
-help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
-
-build: ## Build the multica CLI package
+build:
 	nix build .#multica-cli
 
-check: ## Evaluate the flake and run all checks (CLI build + VM test)
+check:
 	nix flake check -L
 
-test: ## Run the integration VM test only
+test:
 	nix build -L .#checks.$(SYSTEM).integration
 
-fmt: ## Format all Nix files
+fmt:
 	nix fmt
 
-fmt-check: ## Check formatting without writing
+fmt-check:
 	nix run nixpkgs#nixpkgs-fmt -- --check .
 
-dev: ## Enter the dev shell
+dev:
 	nix develop
 
-update-digests: ## Print current GHCR image digests for the pinned version
+update-digests:
 	@for r in multica-backend; do \
 	  t=$$(curl -s "https://ghcr.io/token?scope=repository:multica-ai/$$r:pull&service=ghcr.io" | jq -r .token); \
 	  d=$$(curl -sI -H "Authorization: Bearer $$t" \

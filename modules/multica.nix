@@ -1,45 +1,23 @@
-# NixOS module: stand up a self-hosted Multica server declaratively.
-#
-# Multica's server is a prebuilt backend OCI image that talks to a PostgreSQL 17 +
-# pgvector database. This module runs that image via `virtualisation.oci-containers`
-# and provisions the database natively with `services.postgresql`. Clients are the
-# desktop app and CLI, which speak to the backend API directly; there is no browser
-# web frontend.
-#
-# Round 1 keeps networking simple: the backend container uses host networking, so
-# it reaches native postgres over localhost. The NixOS firewall (closed by default)
-# is what keeps the port off the network; open it deliberately with `openFirewall`.
-# A hardened bridged variant can come later.
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.multica;
 
-  # Backend image, pinned by digest for reproducibility (v0.4.41).
-  # Bump with a new digest resolved via:
-  #   skopeo inspect docker://ghcr.io/multica-ai/multica-backend:vX.Y.Z | jq -r .Digest
   defaultBackendImage = "ghcr.io/multica-ai/multica-backend@sha256:a1c1053fc014b967ae33404eae5a6f725a4befa416e5c9fc657a4b6103f34723";
 
   backendUrl = "http://${cfg.host}:${toString cfg.backendPort}";
 
-  # Native postgres, reached over the loopback that host-networked containers share.
   databaseUrl = "postgres://${cfg.database.user}@127.0.0.1:5432/${cfg.database.name}?sslmode=disable";
 
   jsonFormat = pkgs.formats.json { };
 
-  # Resolve a skill body / bundled file to a store path, mirroring the
-  # text-or-source pair used by environment.etc.
   bodyPath = name: entry:
     if entry.source != null
     then entry.source
-    else pkgs.writeText "multica-skill-${name}" (lib.optionalString (entry.text != null) entry.text);
+    else pkgs.writeText "multica-skill-${name}" entry.text;
 
-  # Write inline text (agent/squad instructions) to a store path.
   textFile = name: s: pkgs.writeText name s;
 
-  # Desired state as a JSON manifest the reconciler reads with jq. Pure function of
-  # config, so its store path only changes when something changes — that path is the
-  # reconcile service's restartTrigger.
   reconcileManifest = jsonFormat.generate "multica-reconcile.json" {
     skills = lib.mapAttrsToList
       (name: skill: {
@@ -97,12 +75,6 @@ let
       cfg.autopilots;
   };
 
-  # Declarative reconciler: the workspace is fully owned by this config.
-  # Declared resources are created/updated to match; anything in the workspace NOT
-  # declared is deleted (skills/autopilots: hard-deleted; agents/squads: archived).
-  # An agent's skill assignments and a squad's members are also replaced to match.
-  # Auth is a mul_… PAT in MULTICA_TOKEN or, in dev mode, an auto session; without
-  # either we skip rather than fail the rebuild.
   reconcile = pkgs.writeShellApplication {
     name = "multica-reconcile";
     runtimeInputs = [ cfg.package pkgs.jq pkgs.curl pkgs.coreutils ];
@@ -110,7 +82,6 @@ let
       manifest="$1"
       dev_mode=${if cfg.devMode then "1" else "0"}
 
-      # The backend container may be up before its API is ready; wait for health.
       for _ in $(seq 1 60); do
         if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
           break
@@ -118,13 +89,8 @@ let
         sleep 2
       done
 
-      # Resolve a token. Prefer MULTICA_TOKEN (a mul_… PAT from environmentFile);
-      # otherwise, in dev mode, log in with the fixed code and use the session JWT
-      # directly (the CLI accepts it) — fetched fresh each run, nothing persisted.
       if [ -z "''${MULTICA_TOKEN:-}" ]; then
         if [ "$dev_mode" = "1" ]; then
-          # send-code is rate-limited per email, so two reconciles close together can
-          # get a 429. Retry a few times rather than failing the rebuild.
           sent=0
           for _ in $(seq 1 6); do
             status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
@@ -152,9 +118,6 @@ let
         fi
       fi
 
-      # Resolve the target workspace: honour MULTICA_WORKSPACE_ID if set, else use
-      # the token's sole workspace (creating one in dev mode if none exist) and
-      # refuse to guess when there is more than one.
       if [ -z "''${MULTICA_WORKSPACE_ID:-}" ]; then
         count=$(multica workspace list --output json | jq 'length')
         if [ "$count" = "0" ]; then
@@ -178,7 +141,6 @@ let
         export MULTICA_WORKSPACE_ID
       fi
 
-      # ---- skills ----------------------------------------------------------
       existing=$(multica skill list --output json)
 
       jq -c '.skills[]' "$manifest" | while read -r skill; do
@@ -210,153 +172,137 @@ let
         done
       done
 
-      # ---- agents & squads (need a runtime) --------------------------------
-      # In a function so it can bail (no agents/squads, or no runtime) without
-      # skipping the quick-actions step that follows.
       reconcile_agents_squads() {
-      want_agents=$(jq '.agents | length' "$manifest")
-      want_squads=$(jq '.squads | length' "$manifest")
-      if [ "$want_agents" = "0" ] && [ "$want_squads" = "0" ]; then
-        return 0
-      fi
-
-      runtimes=$(multica runtime list --output json)
-      rt_count=$(jq 'length' <<<"$runtimes")
-      if [ "$rt_count" = "0" ]; then
-        echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
-        return 0
-      fi
-
-      skills_all=$(multica skill list --output json)
-      existing_agents=$(multica agent list --output json)
-
-      jq -c '.agents[]' "$manifest" | while read -r agent; do
-        name=$(jq -r '.name' <<<"$agent")
-
-        rt=$(jq -r '.runtime // empty' <<<"$agent")
-        if [ -n "$rt" ]; then
-          rtid=$(jq -r --arg r "$rt" 'map(select(.id == $r or .name == $r)) | (.[0].id // empty)' <<<"$runtimes")
-        elif [ "$rt_count" = "1" ]; then
-          rtid=$(jq -r '.[0].id' <<<"$runtimes")
-        else
-          echo "multica-reconcile: agent $name has no runtime set and $rt_count runtimes exist; set services.multica.agents.$name.runtime." >&2
-          exit 1
-        fi
-        if [ -z "$rtid" ]; then
-          echo "multica-reconcile: agent $name runtime '$rt' not found." >&2
-          exit 1
+        want_agents=$(jq '.agents | length' "$manifest")
+        want_squads=$(jq '.squads | length' "$manifest")
+        if [ "$want_agents" = "0" ] && [ "$want_squads" = "0" ]; then
+          return 0
         fi
 
-        args=()
-        v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
-        v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$(cat "$v")")
-        v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
-        v=$(jq -r '.thinkingLevel // empty' <<<"$agent"); [ -n "$v" ] && args+=(--thinking-level "$v")
-        v=$(jq -r '.visibility // empty' <<<"$agent");    [ -n "$v" ] && args+=(--visibility "$v")
-        v=$(jq -r '.maxConcurrentTasks // empty' <<<"$agent"); [ -n "$v" ] && args+=(--max-concurrent-tasks "$v")
-        v=$(jq -c '.customArgs' <<<"$agent");    [ "$v" != "[]" ] && [ "$v" != "null" ] && args+=(--custom-args "$v")
-        v=$(jq -c '.runtimeConfig' <<<"$agent"); [ "$v" != "{}" ] && [ "$v" != "null" ] && args+=(--runtime-config "$v")
-        v=$(jq -r '.customEnvFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--custom-env-file "$v")
-        v=$(jq -r '.mcpConfigFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--mcp-config-file "$v")
+        runtimes=$(multica runtime list --output json)
+        rt_count=$(jq 'length' <<<"$runtimes")
+        if [ "$rt_count" = "0" ]; then
+          echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
+          return 0
+        fi
 
-        id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
-        if [ -n "$id" ]; then
-          echo "multica-reconcile: updating agent $name ($id)"
-          multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
-        else
-          # Check if an archived agent with this name exists and restore it rather than
-          # creating a duplicate (agents are soft-deleted via archive, not hard-deleted).
-          all_agents=$(multica agent list --include-archived --output json)
-          archived_id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$all_agents")
-          if [ -n "$archived_id" ]; then
-            echo "multica-reconcile: restoring archived agent $name ($archived_id)"
-            multica agent restore "$archived_id" >/dev/null
-            id="$archived_id"
-            multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
+        skills_all=$(multica skill list --output json)
+        existing_agents=$(multica agent list --output json)
+
+        jq -c '.agents[]' "$manifest" | while read -r agent; do
+          name=$(jq -r '.name' <<<"$agent")
+
+          rt=$(jq -r '.runtime // empty' <<<"$agent")
+          if [ -n "$rt" ]; then
+            rtid=$(jq -r --arg r "$rt" 'map(select(.id == $r or .name == $r)) | (.[0].id // empty)' <<<"$runtimes")
+          elif [ "$rt_count" = "1" ]; then
+            rtid=$(jq -r '.[0].id' <<<"$runtimes")
           else
-            echo "multica-reconcile: creating agent $name"
-            id=$(multica agent create --name "$name" --runtime-id "$rtid" "''${args[@]}" --output json | jq -r '.id')
-          fi
-        fi
-
-        # Skill assignments: replace to match the declared set (empty clears).
-        # Pass the skill list via --slurpfile, not --argjson: a full list can exceed
-        # the kernel's single-argument limit (MAX_ARG_STRLEN, 128K) and abort jq.
-        skill_ids=$(jq -r --slurpfile all <(printf '%s' "$skills_all") '[ .skills[] as $n | ($all[0][] | select(.name == $n) | .id) ] | join(",")' <<<"$agent")
-        multica agent skills set "$id" --skill-ids "$skill_ids" >/dev/null
-      done
-
-      # Refresh agents so squad leaders/members can resolve newly-created ids.
-      existing_agents=$(multica agent list --output json)
-      existing_squads=$(multica squad list --output json)
-
-      jq -c '.squads[]' "$manifest" | while read -r squad; do
-        name=$(jq -r '.name' <<<"$squad")
-        leader=$(jq -r '.leader' <<<"$squad")
-        leader_id=$(jq -r --arg l "$leader" 'map(select(.name == $l or .id == $l)) | (.[0].id // empty)' <<<"$existing_agents")
-        if [ -z "$leader_id" ]; then
-          echo "multica-reconcile: squad $name leader '$leader' not found." >&2
-          exit 1
-        fi
-        description=$(jq -r '.description' <<<"$squad")
-        instr=$(jq -r '.instructions // empty' <<<"$squad")
-
-        sid=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_squads")
-        if [ -n "$sid" ]; then
-          echo "multica-reconcile: updating squad $name ($sid)"
-          uargs=(--leader "$leader_id")
-          [ -n "$description" ] && uargs+=(--description "$description")
-          [ -n "$instr" ] && uargs+=(--instructions "$(cat "$instr")")
-          multica squad update "$sid" "''${uargs[@]}" >/dev/null
-        else
-          echo "multica-reconcile: creating squad $name"
-          cargs=(--name "$name" --leader "$leader_id")
-          [ -n "$description" ] && cargs+=(--description "$description")
-          sid=$(multica squad create "''${cargs[@]}" --output json | jq -r '.id')
-          [ -n "$instr" ] && multica squad update "$sid" --instructions "$(cat "$instr")" >/dev/null
-        fi
-
-        # Members: replace to match. The leader is auto-added with role 'leader';
-        # never touch it. Add/role-fix declared members, then remove undeclared ones.
-        current=$(multica squad member list "$sid" --output json)
-        jq -c '.members[]' <<<"$squad" | while read -r m; do
-          magent=$(jq -r '.agent' <<<"$m")
-          mrole=$(jq -r '.role' <<<"$m")
-          maid=$(jq -r --arg a "$magent" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$existing_agents")
-          if [ -z "$maid" ]; then
-            echo "multica-reconcile: squad $name member '$magent' not found." >&2
+            echo "multica-reconcile: agent $name has no runtime set and $rt_count runtimes exist; set services.multica.agents.$name.runtime." >&2
             exit 1
           fi
-          [ "$maid" = "$leader_id" ] && continue
-          cur_role=$(jq -r --arg id "$maid" 'map(select(.member_id == $id)) | (.[0].role // empty)' <<<"$current")
-          if [ -z "$cur_role" ]; then
-            echo "multica-reconcile: squad $name add member $magent"
-            multica squad member add "$sid" --member-id "$maid" --role "$mrole" --type agent >/dev/null
-          elif [ "$cur_role" != "$mrole" ]; then
-            multica squad member set-role "$sid" --member-id "$maid" --role "$mrole" --member-type agent >/dev/null
+          if [ -z "$rtid" ]; then
+            echo "multica-reconcile: agent $name runtime '$rt' not found." >&2
+            exit 1
           fi
+
+          args=()
+          v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
+          v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$(cat "$v")")
+          v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
+          v=$(jq -r '.thinkingLevel // empty' <<<"$agent"); [ -n "$v" ] && args+=(--thinking-level "$v")
+          v=$(jq -r '.visibility // empty' <<<"$agent");    [ -n "$v" ] && args+=(--visibility "$v")
+          v=$(jq -r '.maxConcurrentTasks // empty' <<<"$agent"); [ -n "$v" ] && args+=(--max-concurrent-tasks "$v")
+          v=$(jq -c '.customArgs' <<<"$agent");    [ "$v" != "[]" ] && [ "$v" != "null" ] && args+=(--custom-args "$v")
+          v=$(jq -c '.runtimeConfig' <<<"$agent"); [ "$v" != "{}" ] && [ "$v" != "null" ] && args+=(--runtime-config "$v")
+          v=$(jq -r '.customEnvFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--custom-env-file "$v")
+          v=$(jq -r '.mcpConfigFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--mcp-config-file "$v")
+
+          id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
+          if [ -n "$id" ]; then
+            echo "multica-reconcile: updating agent $name ($id)"
+            multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
+          else
+            all_agents=$(multica agent list --include-archived --output json)
+            archived_id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$all_agents")
+            if [ -n "$archived_id" ]; then
+              echo "multica-reconcile: restoring archived agent $name ($archived_id)"
+              multica agent restore "$archived_id" >/dev/null
+              id="$archived_id"
+              multica agent update "$id" --runtime-id "$rtid" "''${args[@]}" >/dev/null
+            else
+              echo "multica-reconcile: creating agent $name"
+              id=$(multica agent create --name "$name" --runtime-id "$rtid" "''${args[@]}" --output json | jq -r '.id')
+            fi
+          fi
+
+          skill_ids=$(jq -r --slurpfile all <(printf '%s' "$skills_all") '[ .skills[] as $n | ($all[0][] | select(.name == $n) | .id) ] | join(",")' <<<"$agent")
+          multica agent skills set "$id" --skill-ids "$skill_ids" >/dev/null
         done
 
-        # --slurpfile, not --argjson: the agent list (with instructions) can exceed the
-        # kernel's single-argument limit (MAX_ARG_STRLEN, 128K) once enough agents exist.
-        keep=$(jq -r --slurpfile agents <(printf '%s' "$existing_agents") '[ .members[].agent as $a | ($agents[0][] | select(.name == $a or .id == $a) | .id) ] | join(" ")' <<<"$squad")
-        keep=" $leader_id $keep "
-        jq -r '.[] | select(.role != "leader") | .member_id' <<<"$current" | while read -r mid; do
-          case "$keep" in
-            *" $mid "*) : ;;
-            *)
-              echo "multica-reconcile: squad $name remove member $mid"
-              multica squad member remove "$sid" --member-id "$mid" --type agent >/dev/null
-              ;;
-          esac
+        existing_agents=$(multica agent list --output json)
+        existing_squads=$(multica squad list --output json)
+
+        jq -c '.squads[]' "$manifest" | while read -r squad; do
+          name=$(jq -r '.name' <<<"$squad")
+          leader=$(jq -r '.leader' <<<"$squad")
+          leader_id=$(jq -r --arg l "$leader" 'map(select(.name == $l or .id == $l)) | (.[0].id // empty)' <<<"$existing_agents")
+          if [ -z "$leader_id" ]; then
+            echo "multica-reconcile: squad $name leader '$leader' not found." >&2
+            exit 1
+          fi
+          description=$(jq -r '.description' <<<"$squad")
+          instr=$(jq -r '.instructions // empty' <<<"$squad")
+
+          sid=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_squads")
+          if [ -n "$sid" ]; then
+            echo "multica-reconcile: updating squad $name ($sid)"
+            uargs=(--leader "$leader_id")
+            [ -n "$description" ] && uargs+=(--description "$description")
+            [ -n "$instr" ] && uargs+=(--instructions "$(cat "$instr")")
+            multica squad update "$sid" "''${uargs[@]}" >/dev/null
+          else
+            echo "multica-reconcile: creating squad $name"
+            cargs=(--name "$name" --leader "$leader_id")
+            [ -n "$description" ] && cargs+=(--description "$description")
+            sid=$(multica squad create "''${cargs[@]}" --output json | jq -r '.id')
+            [ -n "$instr" ] && multica squad update "$sid" --instructions "$(cat "$instr")" >/dev/null
+          fi
+
+          current=$(multica squad member list "$sid" --output json)
+          jq -c '.members[]' <<<"$squad" | while read -r m; do
+            magent=$(jq -r '.agent' <<<"$m")
+            mrole=$(jq -r '.role' <<<"$m")
+            maid=$(jq -r --arg a "$magent" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$existing_agents")
+            if [ -z "$maid" ]; then
+              echo "multica-reconcile: squad $name member '$magent' not found." >&2
+              exit 1
+            fi
+            [ "$maid" = "$leader_id" ] && continue
+            cur_role=$(jq -r --arg id "$maid" 'map(select(.member_id == $id)) | (.[0].role // empty)' <<<"$current")
+            if [ -z "$cur_role" ]; then
+              echo "multica-reconcile: squad $name add member $magent"
+              multica squad member add "$sid" --member-id "$maid" --role "$mrole" --type agent >/dev/null
+            elif [ "$cur_role" != "$mrole" ]; then
+              multica squad member set-role "$sid" --member-id "$maid" --role "$mrole" --member-type agent >/dev/null
+            fi
+          done
+
+          keep=$(jq -r --slurpfile agents <(printf '%s' "$existing_agents") '[ .members[].agent as $a | ($agents[0][] | select(.name == $a or .id == $a) | .id) ] | join(" ")' <<<"$squad")
+          keep=" $leader_id $keep "
+          jq -r '.[] | select(.role != "leader") | .member_id' <<<"$current" | while read -r mid; do
+            case "$keep" in
+              *" $mid "*) : ;;
+              *)
+                echo "multica-reconcile: squad $name remove member $mid"
+                multica squad member remove "$sid" --member-id "$mid" --type agent >/dev/null
+                ;;
+            esac
+          done
         done
-      done
       }
       reconcile_agents_squads
 
-      # ---- quick actions (REST; no CLI) ------------------------------------
-      # Named prompts that dispatch to an existing agent or squad. Reconciled last,
-      # via the API directly. Additive: create/update declared ones, never delete.
       want_qa=$(jq '.quickActions | length' "$manifest")
       if [ "$want_qa" != "0" ]; then
         qa_agents=$(multica agent list --output json)
@@ -364,7 +310,7 @@ let
         qa_existing=$(curl -fsS \
           -H "Authorization: Bearer $MULTICA_TOKEN" \
           -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
-          "$MULTICA_SERVER_URL/api/quick-actions" | jq '.quick_actions')
+          "$MULTICA_SERVER_URL/api/quick-actions" | jq '.quick_actions // []')
 
         jq -c '.quickActions[]' "$manifest" | while read -r qa; do
           name=$(jq -r '.name' <<<"$qa")
@@ -404,10 +350,6 @@ let
         done
       fi
 
-      # ---- autopilots (need an assignee agent) -----------------------------
-      # Scheduled/triggered agent automations. Reconciled after agents/squads so
-      # they can reference declared agents. Additive: create/update declared ones,
-      # never delete. Only schedule triggers are managed here, upserted by label.
       want_ap=$(jq '.autopilots | length' "$manifest")
       if [ "$want_ap" != "0" ]; then
         ap_agents=$(multica agent list --output json)
@@ -444,11 +386,9 @@ let
           else
             echo "multica-reconcile: creating autopilot $title"
             id=$(multica autopilot create --title "$title" "''${args[@]}" --output json | jq -r '.id')
-            # --status is update-only; apply it after create when requested.
             [ -n "$status" ] && multica autopilot update "$id" --status "$status" >/dev/null
           fi
 
-          # Schedule triggers: upsert by label; delete triggers not declared (full ownership).
           existing_triggers=$(multica autopilot trigger-list "$id" --output json | jq '.triggers // .')
           jq -c '.triggers[]' <<<"$ap" | while read -r tr; do
             label=$(jq -r '.label' <<<"$tr")
@@ -466,7 +406,6 @@ let
               echo "multica-reconcile: adding autopilot $title trigger $label"
               multica autopilot trigger-add "$id" --kind schedule \
                 --cron "$cron" --timezone "$tz" --label "$label" >/dev/null
-              # trigger-add always enables; disable in a follow-up when requested.
               if [ "$enabled" != "true" ]; then
                 tid=$(multica autopilot trigger-list "$id" --output json \
                   | jq -r --arg l "$label" '(.triggers // .) | map(select(.label == $l)) | (.[0].id // empty)')
@@ -475,7 +414,6 @@ let
             fi
           done
 
-          # Prune triggers not in the declared set (full ownership of triggers too).
           want_labels=$(jq -r '.triggers[].label' <<<"$ap")
           while IFS=$'\t' read -r tid tlabel; do
             [ -n "$tid" ] || continue
@@ -487,21 +425,7 @@ let
         done
       fi
 
-      # ---- prune: full ownership of the workspace ----------------------------
-      # Delete anything present in the workspace that is NOT declared in the manifest.
-      # This makes reconciliation fully declarative: the workspace exactly matches the
-      # config. Dependent resources are pruned first so each delete hits an unreferenced
-      # object. Agents and squads are soft-deleted (archived); skills and autopilots are
-      # hard-deleted. Failures are logged but don't abort the rebuild — they'll retry on
-      # the next config change.
-      #
-      # WARNING: resources created in the Multica UI or CLI that are NOT in this config
-      # will be deleted. This workspace must be managed exclusively by this config.
       prune_kind() {
-        # $1 = identity field (name or title)
-        # $2 = live JSON array (already fetched)
-        # $3 = manifest key (skills, agents, squads, quickActions, autopilots)
-        # $4 = shell function to call with the resource id
         local idfield="$1" live="$2" key="$3" delfn="$4"
         local want
         want=$(jq -r --arg k "$key" --arg f "$idfield" '.[$k][]? | .[$f]' "$manifest")
@@ -523,7 +447,6 @@ let
       del_agent() { multica agent archive "$1" >/dev/null; }
       del_skill() { multica skill delete "$1" --yes >/dev/null; }
 
-      # Fetch fresh live lists post-apply so newly-created resources are never pruned.
       live_aps=$(multica autopilot list --output json | jq '.autopilots // .')
       live_qas=$(curl -fsS \
         -H "Authorization: Bearer $MULTICA_TOKEN" \
@@ -556,7 +479,6 @@ in
 
     desktopPackage = lib.mkOption {
       type = lib.types.package;
-      # Seed the desktop client's runtime config to point at this instance, not the cloud.
       default = pkgs.callPackage ../pkgs/multica-desktop.nix {
         serverUrl = backendUrl;
       };
@@ -1036,7 +958,7 @@ in
             default = { };
             description = ''
               Schedule (cron) triggers, keyed by label (the label is the identity).
-              Upserted on each reconcile; triggers not listed here are left untouched.
+              Upserted on each reconcile; triggers not listed here are deleted.
             '';
             type = lib.types.attrsOf (lib.types.submodule {
               options = {
@@ -1066,7 +988,6 @@ in
     environment.systemPackages = [ cfg.package ]
       ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) cfg.desktopPackage;
 
-    # --- Database: native PostgreSQL 17 + pgvector -------------------------------
     services.postgresql = lib.mkIf cfg.database.createLocally {
       enable = true;
       package = pkgs.postgresql_17;
@@ -1076,19 +997,12 @@ in
         name = cfg.database.user;
         ensureDBOwnership = true;
       }];
-      # Host-networked containers connect from the loopback address; trust that
-      # single db/user pair over loopback only.
       authentication = lib.mkAfter ''
         host ${cfg.database.name} ${cfg.database.user} 127.0.0.1/32 trust
         host ${cfg.database.name} ${cfg.database.user} ::1/128      trust
       '';
     };
 
-    # Ensure the pgvector extension exists in the Multica database.
-    # `ensureDatabases`/`ensureUsers` run in postgresql.service's postStart, so the
-    # database and user exist once that unit is active — that's all we hard-require.
-    # postgresql-setup.service is only soft-ordered (after, not requires): it is pulled
-    # in via postgresql.target, and hard-requiring it cancels this job if it doesn't run.
     systemd.services.multica-db-init = lib.mkIf cfg.database.createLocally {
       description = "Create pgvector extension for Multica";
       after = [ "postgresql.service" "postgresql-setup.service" ];
@@ -1105,13 +1019,11 @@ in
       '';
     };
 
-    # Persistent uploads directory bind-mounted into the backend.
     systemd.tmpfiles.rules = [
       "d /var/lib/multica 0750 root root -"
       "d /var/lib/multica/uploads 0750 root root -"
     ];
 
-    # --- Server: backend via docker ---------------------------------------------
     virtualisation.oci-containers.backend = "docker";
 
     virtualisation.oci-containers.containers.multica-backend = {
@@ -1121,20 +1033,14 @@ in
         DATABASE_URL = databaseUrl;
         PORT = toString cfg.backendPort;
       } // lib.optionalAttrs cfg.devMode {
-        # Non-production so the backend honours the fixed dev verification code.
-        # Combined with MULTICA_DEV_VERIFICATION_CODE this lets you log in offline
-        # (no SMTP) with any email + the code; verify-code auto-creates the user.
-        # Local/dev only — the firewall is closed by default; never expose this.
         APP_ENV = "development";
         MULTICA_DEV_VERIFICATION_CODE = cfg.devVerificationCode;
       } // cfg.extraBackendEnvironment;
       environmentFiles = [ cfg.environmentFile ];
       volumes = [ "/var/lib/multica/uploads:/app/data/uploads" ];
-      # Host networking: reach native postgres over 127.0.0.1, expose backendPort.
       extraOptions = [ "--network=host" ];
     };
 
-    # The backend must not start until the database is up and seeded.
     systemd.services.docker-multica-backend = {
       after = [ "postgresql.service" "multica-db-init.service" ];
       requires = [ "postgresql.service" "multica-db-init.service" ];
@@ -1143,7 +1049,6 @@ in
     networking.firewall.allowedTCPPorts =
       lib.mkIf cfg.openFirewall [ cfg.backendPort ];
 
-    # Each skill body and bundled file must come from exactly one of text/source.
     assertions =
       lib.mapAttrsToList
         (name: skill: {
@@ -1166,10 +1071,6 @@ in
         })
         cfg.autopilots;
 
-    # Reconcile declared resources and prune undeclared ones once the backend is up.
-    # Always defined (not gated on non-empty sets) so that removing the last declared
-    # resource still triggers a reconcile that can prune it from the workspace.
-    # restartTriggers ensures re-runs only when the declared set actually changes.
     systemd.services.multica-reconcile = {
       description = "Reconcile declarative Multica resources (prunes undeclared ones)";
       after = [ "docker-multica-backend.service" ];

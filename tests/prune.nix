@@ -1,16 +1,3 @@
-# Prune test: verify that removing a declared resource from the config causes the
-# reconciler to delete it from the workspace on the next rebuild.
-#
-# Strategy: declare one skill (pr-review) in the base config. A `specialisation`
-# removes it. After switching to the specialisation the reconciler re-runs
-# (restartTriggers fires because the manifest store path changed) and must delete
-# the skill row. A second assertion creates a skill out-of-band (simulating a
-# UI-created resource) and verifies it too is deleted, proving full ownership.
-#
-# The switch is driven by `switch-to-configuration test` against the specialisation
-# toplevel — the canonical NixOS pattern (see nixos/tests/home-assistant.nix).
-# All assertions read postgres directly to avoid a second /auth/send-code round-trip
-# (the backend rate-limits that endpoint per email).
 { pkgs, self }:
 let
   inherit (pkgs) lib;
@@ -56,7 +43,6 @@ pkgs.testers.runNixOSTest {
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
       backendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
-      # Config 1: declare one skill. The reconciler creates it.
       skills.pr-review = {
         description = "How we review PRs";
         text = ''
@@ -66,8 +52,6 @@ pkgs.testers.runNixOSTest {
       };
     };
 
-    # Config 2: remove the declared skill. The reconciler must delete it.
-    # lib.mkForce is required to override the parent's skills.pr-review.
     specialisation.pruned.configuration = {
       services.multica.skills = lib.mkForce { };
     };
@@ -77,27 +61,23 @@ pkgs.testers.runNixOSTest {
     let
       prunedSwitch =
         "${nodes.machine.system.build.toplevel}/specialisation/pruned/bin/switch-to-configuration test";
-    in ''
+    in
+    ''
       machine.start()
 
-      # Bring the stack up.
       machine.wait_for_unit("postgresql.service")
       machine.wait_for_unit("multica-db-init.service")
       machine.wait_for_unit("docker-multica-backend.service")
       machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/health", timeout=180)
 
-      # CONFIG 1: reconciler creates pr-review.
       machine.wait_for_unit("multica-reconcile.service")
       machine.succeed("journalctl -u multica-reconcile.service | grep -q 'creating pr-review'")
       machine.succeed(
           "sudo -u postgres psql -d multica -tAc "
           "\"select 1 from skill where name = 'pr-review'\" | grep -q 1"
       )
-      # Confirm the terminal log line so the cursor approach below works reliably.
       machine.succeed("journalctl -u multica-reconcile.service | grep -q 'reconcile complete'")
 
-      # Create a skill out-of-band (simulating a UI/CLI-created resource not in config).
-      # Config 2 declares no skills, so this must also be pruned (full ownership).
       token_json = machine.succeed(
           "curl -fsS -X POST -H 'Content-Type: application/json' "
           "-d '{\"email\":\"admin@multica.local\",\"code\":\"888888\"}' "
@@ -121,24 +101,18 @@ pkgs.testers.runNixOSTest {
           "\"select 1 from skill where name = 'ui-created'\" | grep -q 1"
       )
 
-      # Capture a journal cursor so we can scope assertions to the NEXT reconcile run.
       cursor = machine.succeed(
           "journalctl -u multica-reconcile.service -n 0 --show-cursor | grep -oP '(?<=cursor: ).*'"
       ).strip()
 
-      # CONFIG 2: switch to the specialisation that removes the skill.
-      # This changes the manifest store path → restartTriggers fires → reconciler re-runs.
       machine.succeed("${prunedSwitch}")
 
-      # Wait for the new reconcile run to complete (RemainAfterExit means wait_for_unit
-      # would pass immediately on the already-active instance; use the terminal log line).
       machine.wait_until_succeeds(
           f"journalctl -u multica-reconcile.service --after-cursor='{cursor}' "
           "| grep -q 'reconcile complete'",
           timeout=120
       )
 
-      # The prune log must have fired for both skills.
       machine.succeed(
           f"journalctl -u multica-reconcile.service --after-cursor='{cursor}' "
           "| grep -q \"pruning skills 'pr-review'\""
@@ -148,7 +122,6 @@ pkgs.testers.runNixOSTest {
           "| grep -q \"pruning skills 'ui-created'\""
       )
 
-      # Both skill rows must be gone.
       machine.succeed(
           "sudo -u postgres psql -d multica -tAc "
           "\"select count(*) from skill\" | grep -q '^0$'"

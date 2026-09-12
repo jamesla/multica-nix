@@ -19,8 +19,6 @@
       forLinux = forSystems linuxSystems;
     in
     {
-      # The CLI package, available on all supported systems. The desktop client is an
-      # Electron AppImage, so it is Linux-only.
       packages = forAllSystems ({ pkgs, system, ... }: {
         multica-cli = pkgs.callPackage ./pkgs/multica-cli.nix { };
         default = pkgs.callPackage ./pkgs/multica-cli.nix { };
@@ -34,11 +32,9 @@
         multica-desktop = final.callPackage ./pkgs/multica-desktop.nix { };
       };
 
-      # The star of round 1: a NixOS module that stands up a self-hosted Multica server.
       nixosModules.multica = import ./modules/multica.nix;
       nixosModules.default = self.nixosModules.multica;
 
-      # `nix flake check` builds the CLI and runs the VM tests (Linux only).
       checks = forLinux ({ pkgs, system, ... }: {
         multica-cli = self.packages.${system}.multica-cli;
         integration = import ./tests/integration.nix { inherit pkgs self; };

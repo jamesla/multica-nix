@@ -1,10 +1,3 @@
-# Multica desktop client — prebuilt Electron AppImage from upstream GitHub releases.
-# AppImages expect an FHS runtime that NixOS does not provide, so we wrap it with
-# appimageTools rather than running the raw binary.
-#
-# The packaged app defaults to Multica cloud; its only production hook for the server
-# is `$HOME/.multica/desktop.json` (read at startup). To point it at the instance this
-# flake installs, the launch wrapper seeds that file before exec — no per-user config.
 { lib
 , stdenv
 , appimageTools
@@ -17,12 +10,8 @@
 let
   version = "0.4.41";
 
-  # ws(s)://host:port/ws form of the backend server URL.
   wsUrl = "${lib.replaceStrings [ "http://" "https://" ] [ "ws://" "wss://" ] serverUrl}/ws";
 
-  # system -> release asset name + hash. Linux only: mac ships a .dmg, not an AppImage.
-  # These hashes are computed from the release assets (upstream's checksums.txt covers
-  # the CLI only); re-verify on a version bump.
   platforms = {
     x86_64-linux = {
       asset = "x86_64";
@@ -45,7 +34,6 @@ let
     inherit (platform) hash;
   };
 
-  # Extract the bundled .desktop entry and icons so the app shows up in launchers.
   contents = appimageTools.extractType2 { inherit pname version src; };
 
   unwrapped = appimageTools.wrapType2 {
@@ -68,9 +56,6 @@ let
     };
   };
 in
-# Wrap the launcher so it points the app at this instance before starting. The app reads
-  # `$HOME/.multica/desktop.json` at startup (and never writes it), so overwriting on each
-  # launch keeps it pinned to the installed server for whichever user runs it.
 symlinkJoin {
   name = "multica-desktop-${version}";
   paths = [ unwrapped ];

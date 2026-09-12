@@ -1,12 +1,8 @@
-# Multica CLI — prebuilt, statically-linked Go binary from upstream GitHub releases.
-# We wrap the published release tarball rather than building from source: the CLI
-# is a single static binary, so there is nothing to patch or compile.
 { lib, stdenvNoCC, fetchurl }:
 
 let
   version = "0.4.41";
 
-  # system -> release asset name + hash. Update all four together on a version bump.
   platforms = {
     x86_64-linux = {
       asset = "linux-amd64";
@@ -38,7 +34,6 @@ stdenvNoCC.mkDerivation {
     inherit (plat) hash;
   };
 
-  # The tarball has files at the top level (multica, LICENSE, NOTICE, README*).
   sourceRoot = ".";
 
   dontConfigure = true;
@@ -52,7 +47,6 @@ stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
 
-  # Static binary, so we can smoke-test it during the build on a matching host.
   doInstallCheck = true;
   installCheckPhase = ''
     $out/bin/multica --version | grep -q "${version}"
