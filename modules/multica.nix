@@ -182,8 +182,22 @@ let
         runtimes=$(multica runtime list --output json)
         rt_count=$(jq 'length' <<<"$runtimes")
         if [ "$rt_count" = "0" ]; then
-          echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
-          return 0
+          if [ "$dev_mode" = "1" ]; then
+            echo "multica-reconcile: no runtimes registered; waiting for daemon to start (dev mode)..." >&2
+            for i in $(seq 1 30); do
+              sleep 10
+              runtimes=$(multica runtime list --output json)
+              rt_count=$(jq 'length' <<<"$runtimes")
+              if [ "$rt_count" != "0" ]; then
+                echo "multica-reconcile: runtime registered after $((i * 10))s; proceeding with agents/squads." >&2
+                break
+              fi
+            done
+          fi
+          if [ "$rt_count" = "0" ]; then
+            echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
+            return 0
+          fi
         fi
 
         skills_all=$(multica skill list --output json)
