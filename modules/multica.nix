@@ -9,6 +9,26 @@ let
 
   databaseUrl = "postgres://${cfg.database.user}@127.0.0.1:5432/${cfg.database.name}?sslmode=disable";
 
+  # Entrypoint wrapper for multica-backend: generates JWT_SECRET inside the
+  # container on first run (stored at /app/secrets/jwt_secret), idempotently
+  # reuses it on subsequent starts (via persistent bind mount).
+  # Uses #!/bin/sh shebang for Alpine container compatibility.
+  multicaBackendEntrypoint = pkgs.writeTextFile {
+    name = "multica-backend-entrypoint";
+    executable = true;
+    text = ''
+      #!/bin/sh
+      set -eu
+      SECRET_FILE=/app/secrets/jwt_secret
+      if [ ! -s "$SECRET_FILE" ]; then
+        head -c 32 /dev/urandom | xxd -p -c 256 > "$SECRET_FILE"
+        chmod 600 "$SECRET_FILE"
+      fi
+      export JWT_SECRET="$(cat "$SECRET_FILE")"
+      exec ./entrypoint.sh "$@"
+    '';
+  };
+
   jsonFormat = pkgs.formats.json { };
 
   bodyPath = name: entry:
@@ -1036,6 +1056,7 @@ in
     systemd.tmpfiles.rules = [
       "d /var/lib/multica 0750 root root -"
       "d /var/lib/multica/uploads 0750 root root -"
+      "d /var/lib/multica/secrets 0700 root root -"
     ];
 
     virtualisation.oci-containers.backend = "docker";
@@ -1043,6 +1064,7 @@ in
     virtualisation.oci-containers.containers.multica-backend = {
       image = cfg.backendImage;
       imageFile = cfg.backendImageFile;
+      entrypoint = "/entrypoint-wrapper.sh";
       environment = {
         DATABASE_URL = databaseUrl;
         PORT = toString cfg.backendPort;
@@ -1051,7 +1073,11 @@ in
         MULTICA_DEV_VERIFICATION_CODE = cfg.devVerificationCode;
       } // cfg.extraBackendEnvironment;
       environmentFiles = [ cfg.environmentFile ];
-      volumes = [ "/var/lib/multica/uploads:/app/data/uploads" ];
+      volumes = [
+        "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
+        "/var/lib/multica/secrets:/app/secrets"
+        "/var/lib/multica/uploads:/app/data/uploads"
+      ];
       extraOptions = [ "--network=host" ];
     };
 
