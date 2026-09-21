@@ -577,12 +577,13 @@ in
 
     environmentFile = lib.mkOption {
       type = lib.types.path;
+      default = "/var/lib/multica/env";
       description = ''
         Path to an env file (KEY=VALUE lines) read at runtime, kept OUT of the Nix
-        store. Must define at least JWT_SECRET (generate with `openssl rand -hex 32`).
-        Any other backend secrets/integration vars can live here too.
+        store. JWT_SECRET is auto-generated inside the backend container.
+        Use this file for any other secrets/integration vars (e.g. MULTICA_TOKEN).
       '';
-      example = "/var/lib/multica/secret.env";
+      example = "/var/lib/multica/env";
     };
 
     extraBackendEnvironment = lib.mkOption {
@@ -1057,6 +1058,7 @@ in
       "d /var/lib/multica 0750 root root -"
       "d /var/lib/multica/uploads 0750 root root -"
       "d /var/lib/multica/secrets 0700 root root -"
+      "f /var/lib/multica/env 0644 root root -"
     ];
 
     virtualisation.oci-containers.backend = "docker";
