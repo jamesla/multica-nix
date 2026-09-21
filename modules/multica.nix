@@ -9,10 +9,8 @@ let
 
   databaseUrl = "postgres://${cfg.database.user}@127.0.0.1:5432/${cfg.database.name}?sslmode=disable";
 
-  # Entrypoint wrapper for multica-backend: generates JWT_SECRET inside the
-  # container on first run (stored at /app/secrets/jwt_secret), idempotently
-  # reuses it on subsequent starts (via persistent bind mount).
-  # Uses #!/bin/sh shebang for Alpine container compatibility.
+  # Generate JWT_SECRET inside container on first run, persist via bind mount.
+  # Uses #!/bin/sh for Alpine compatibility (Nix bash path doesn't exist in container).
   multicaBackendEntrypoint = pkgs.writeTextFile {
     name = "multica-backend-entrypoint";
     executable = true;
