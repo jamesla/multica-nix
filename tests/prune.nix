@@ -42,7 +42,14 @@ pkgs.testers.runNixOSTest {
       enable = true;
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
-      backendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
+      host = "localhost";
+      backendPort = 8080;
+      database.createLocally = true;
+      database.name = "multica";
+      database.user = "multica";
+      devLoginEmail = "admin@multica.local";
+      workspaceName = "Test";
+      workspaceSlug = "test";
       skills.pr-review = {
         description = "How we review PRs";
         text = ''

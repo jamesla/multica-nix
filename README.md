@@ -33,44 +33,28 @@ complete option reference with all available settings:
 services.multica = {
   # === REQUIRED ===
   enable = true;                                    # Turn the service on
-  environmentFile = "/var/lib/multica/env";        # Env file (KEY=VALUE) with JWT_SECRET, MULTICA_TOKEN, etc.
+  environmentFile = "/var/lib/multica/env";        # Env file (KEY=VALUE) with MULTICA_TOKEN, etc.
 
   # === CORE SETTINGS ===
-  package = pkgs.callPackage ./pkgs/multica-cli.nix { };           # Multica CLI package
-  desktopPackage = pkgs.callPackage ./pkgs/multica-desktop.nix { }; # Desktop app package
   installDesktop = true;                           # Put desktop app on PATH (Linux only)
 
   # === NETWORKING ===
   host = "localhost";                              # Public host for backend URL in clients
   backendPort = 8080;                              # Backend API listen port
-  openFirewall = false;                            # Open port in firewall
-
-  # === BACKEND ===
-  backendImage = "ghcr.io/multica-ai/multica-backend@sha256:...";  # Backend OCI image (digest-pinned)
-  backendImageFile = null;                         # Optional pre-fetched image tarball
-  extraBackendEnvironment = { };                   # Extra env vars for backend (S3, OAuth, etc.)
 
   # === DATABASE ===
   database.createLocally = true;                   # Provision local PostgreSQL + pgvector
   database.name = "multica";                       # Database name
   database.user = "multica";                       # Database user
 
-  # === DEV MODE ===
-  devMode = true;                                  # Enable passwordless login with fixed code
-  devVerificationCode = "888888";                  # Fixed code for any email (dev mode only)
+  # === WORKSPACE / DEV LOGIN ===
   devLoginEmail = "admin@multica.local";           # Identity reconciler logs in as (dev mode)
   workspaceName = "Default";                       # Workspace name (auto-created in dev mode)
   workspaceSlug = "default";                       # Workspace slug (auto-created in dev mode)
 
-  # === WORKSPACE ===
-  workspaceId = null;                              # Target workspace ID (auto-detect if null)
-
-  # === SANDBOX PACKAGES ===
-  sandboxExtraPackages = [ ];                      # Extra packages in all sandboxes
-
   # === DECLARATIVE SKILLS ===
   # Fully owned by config: declared skills created/updated, undeclared skills deleted on rebuild.
-  # Reconciliation needs MULTICA_TOKEN (production) or auto-login (devMode).
+  # Reconciliation needs MULTICA_TOKEN (production) or passwordless dev-mode login.
   skills = {
     example-skill = {
       description = "Example skill";
@@ -96,14 +80,7 @@ services.multica = {
       instructions = "Be thorough.";                    # System prompt
       runtime = "my-sandbox";                          # Runtime name/id; null = sole runtime auto-used
       model = "claude-opus-5";                         # Model ID; null = runtime default
-      # thinkingLevel = "high";                        # Reasoning effort (runtime-specific)
-      # visibility = "private";                        # "private" (owner) or "workspace" (members)
-      # maxConcurrentTasks = 5;                        # Max concurrent runs (1-50); null = server default
       skills = [ "example-skill" ];                    # Skill names to assign
-      # customArgs = [ "--flag" "value" ];             # Extra runtime CLI args
-      # runtimeConfig = { };                           # Runtime-specific config (JSON)
-      # customEnvFile = "/absolute/path/env.json";     # Secret env vars (kept out of store)
-      # mcpConfigFile = "/absolute/path/mcp.json";     # MCP server config (kept out of store)
     };
   };
 
@@ -143,8 +120,6 @@ services.multica = {
       description = "Example action";
       prompt = "Do something useful.";              # The prompt run when triggered
       assignee = "example-agent";                  # Agent or squad name/id
-      # assigneeType = "agent";                    # "agent" (default) or "squad"
-      # visibility = "private";                    # "private" (you) or "public" (all members)
     };
   };
 
@@ -157,11 +132,7 @@ services.multica = {
     "Example Autopilot" = {
       description = "Example autopilot";           # Used as run prompt
       agent = "example-agent";                    # Agent name/id
-      # mode = "run_only";                         # "run_only" (default) or "create_issue"
-      # project = "proj_123";                      # Project ID for runs/issues (mode: create_issue)
-      # issueTitleTemplate = "Report {{date}}";    # Template for created issues (mode: create_issue, {{date}} only)
-      # subscribers = [ "alice@example.com" ];     # Members to notify
-      # status = "active";                         # "active" or "paused"; null = server default
+      mode = "run_only";                          # "run_only" (default) or "create_issue"
       triggers = {
         example = {
           cron = "0 9 * * *";                     # Cron expression
@@ -184,11 +155,10 @@ have manually created resources to keep, add them to the config first.
 declared agents. Sandboxes spin up after the backend is healthy. If no runtime exists, agents/squads are
 skipped (reconciler logs notice; rebuild succeeds).
 
-**Secrets:** Keep sensitive data out of the Nix store (world-readable). Use `environmentFile` for `JWT_SECRET`,
-`MULTICA_TOKEN`, API keys, etc. Agent `customEnvFile` and `mcpConfigFile` are read at reconcile time as
-absolute file paths (e.g., `/var/lib/multica/agent.env.json`).
+**Secrets:** Keep sensitive data out of the Nix store (world-readable). Use `environmentFile` for
+`MULTICA_TOKEN`, API keys, etc.
 
-**Authentication:** In `devMode = true`, the reconciler auto-logs in using `devLoginEmail` and `devVerificationCode`,
-creating a workspace if none exists. In `devMode = false`, supply a personal access token (`mul_…`) in
-`environmentFile` as `MULTICA_TOKEN=mul_…`. Without a token and outside dev mode, the reconciler skips (does
-not fail the rebuild).
+**Authentication:** The reconciler auto-logs in using `devLoginEmail` with a fixed dev verification code,
+creating a workspace if none exists. Provide a personal access token (`mul_…`) in `environmentFile` as
+`MULTICA_TOKEN=mul_…` to use an existing workspace with a real account. Without a token, the reconciler
+uses dev-mode passwordless login.
