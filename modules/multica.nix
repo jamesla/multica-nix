@@ -571,29 +571,21 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/multica-cli.nix { };
-      defaultText = lib.literalExpression "multica-cli";
       description = "The Multica CLI package to put on PATH (used to administer the server).";
     };
 
     desktopPackage = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/multica-desktop.nix {
-        serverUrl = backendUrl;
-      };
-      defaultText = lib.literalExpression "multica-desktop";
       description = "The Multica desktop client (Electron AppImage) to put on PATH. Linux only.";
     };
 
     installDesktop = lib.mkOption {
       type = lib.types.bool;
-      default = true;
       description = "Whether to put the Multica desktop client on PATH. Linux only.";
     };
 
     host = lib.mkOption {
       type = lib.types.str;
-      default = "localhost";
       description = ''
         Public host used to reach this server (drives the backend URL seeded into
         the desktop client). Set to the machine's hostname/IP if you access Multica
@@ -603,19 +595,16 @@ in
 
     backendPort = lib.mkOption {
       type = lib.types.port;
-      default = 8080;
       description = "Port the backend API listens on.";
     };
 
     backendImage = lib.mkOption {
       type = lib.types.str;
-      default = defaultBackendImage;
       description = "OCI image reference for the Multica backend (digest-pinned by default).";
     };
 
     backendImageFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
-      default = null;
       description = ''
         Optional pre-fetched backend image tarball (e.g. from `dockerTools.pullImage`)
         to load instead of pulling from the registry. Used by the offline test.
@@ -624,7 +613,6 @@ in
 
     sandboxExtraPackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
-      default = [ ];
       description = ''
         Extra Nix packages to install in every sandbox container (e.g. [ pkgs.ripgrep pkgs.gh ]).
         Combined with per-sandbox `extraPackages` when building sandbox images.
@@ -634,47 +622,39 @@ in
     database = {
       createLocally = lib.mkOption {
         type = lib.types.bool;
-        default = true;
         description = "Provision a local PostgreSQL database with pgvector for Multica.";
       };
       name = lib.mkOption {
         type = lib.types.str;
-        default = "multica";
         description = "Database name.";
       };
       user = lib.mkOption {
         type = lib.types.str;
-        default = "multica";
         description = "Database user (owns the database; loopback trust auth).";
       };
     };
 
     environmentFile = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/multica/env";
       description = ''
         Path to an env file (KEY=VALUE lines) read at runtime, kept OUT of the Nix
         store. JWT_SECRET is auto-generated inside the backend container.
         Use this file for any other secrets/integration vars (e.g. MULTICA_TOKEN).
       '';
-      example = "/var/lib/multica/env";
     };
 
     extraBackendEnvironment = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
-      default = { };
       description = "Extra environment variables for the backend container (integrations, S3, OAuth, ...).";
     };
 
     openFirewall = lib.mkOption {
       type = lib.types.bool;
-      default = false;
       description = "Open the backend port in the firewall for access from other machines.";
     };
 
     devMode = lib.mkOption {
       type = lib.types.bool;
-      default = true;
       description = ''
         Run the backend in development mode: enables passwordless login with a
         fixed verification code and lets the skills reconciler mint its own token
@@ -685,13 +665,11 @@ in
 
     devVerificationCode = lib.mkOption {
       type = lib.types.str;
-      default = "888888";
       description = "Fixed login code accepted for any email while `devMode` is on.";
     };
 
     devLoginEmail = lib.mkOption {
       type = lib.types.str;
-      default = "admin@multica.local";
       description = ''
         Identity the skills reconciler logs in as (via `devMode` login) to obtain a
         token when `MULTICA_TOKEN` is unset. Log in to the desktop app with this
@@ -701,7 +679,6 @@ in
 
     workspaceId = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = null;
       description = ''
         Workspace to reconcile `skills` into. If null, the reconciler uses the
         token's sole workspace (creating one in `devMode` if none exist) and fails
@@ -711,18 +688,15 @@ in
 
     workspaceName = lib.mkOption {
       type = lib.types.str;
-      default = "Default";
       description = "Name for the workspace auto-created in `devMode` when none exists.";
     };
 
     workspaceSlug = lib.mkOption {
       type = lib.types.str;
-      default = "default";
       description = "Slug for the workspace auto-created in `devMode` (lowercase, digits, hyphens).";
     };
 
     skills = lib.mkOption {
-      default = { };
       description = ''
         Declarative Multica skills. The attribute name is the skill's name (its
         identity). The workspace is fully owned by this config: declared skills are
@@ -732,52 +706,34 @@ in
         Requires a personal access token (`mul_…`) in `environmentFile` as
         `MULTICA_TOKEN`; without it, reconciliation is skipped.
       '';
-      example = lib.literalExpression ''
-        {
-          pr-review = {
-            description = "How we review pull requests";
-            text = '''
-              # PR review
-              Check tests, scope, and a rollback plan before approving.
-            ''';
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Skill description shown in Multica.";
           };
           text = lib.mkOption {
             type = lib.types.nullOr lib.types.lines;
-            default = null;
             description = "Inline SKILL.md markdown body. Mutually exclusive with `source`.";
           };
           source = lib.mkOption {
             type = lib.types.nullOr lib.types.path;
-            default = null;
             description = "File providing the SKILL.md body. Mutually exclusive with `text`.";
           };
           settings = lib.mkOption {
             type = jsonFormat.type;
-            default = { };
             description = "Optional skill config, serialised to JSON (the CLI's --config).";
           };
           files = lib.mkOption {
-            default = { };
             description = "Extra files bundled with the skill, keyed by their path within the skill.";
             type = lib.types.attrsOf (lib.types.submodule {
               options = {
                 text = lib.mkOption {
                   type = lib.types.nullOr lib.types.lines;
-                  default = null;
                   description = "Inline file body. Mutually exclusive with `source`.";
                 };
                 source = lib.mkOption {
                   type = lib.types.nullOr lib.types.path;
-                  default = null;
                   description = "File providing the body. Mutually exclusive with `text`.";
                 };
               };
@@ -788,7 +744,6 @@ in
     };
 
     agents = lib.mkOption {
-      default = { };
       description = ''
         Declarative Multica agents, reconciled into the workspace on rebuild (after
         skills). The attribute name is the agent's name. The workspace is fully owned
@@ -800,32 +755,18 @@ in
         declarative). Reference one with `runtime`; if the workspace has exactly one,
         it is used automatically. With no runtimes, agents and squads are skipped.
       '';
-      example = lib.literalExpression ''
-        {
-          reviewer = {
-            description = "Reviews pull requests";
-            runtime = "Claude (myhost)";
-            model = "claude-sonnet-4-6";
-            instructions = "Be thorough and terse.";
-            skills = [ "pr-review" ];
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Agent description.";
           };
           instructions = lib.mkOption {
             type = lib.types.nullOr lib.types.lines;
-            default = null;
             description = "System instructions for the agent.";
           };
           runtime = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = ''
               Runtime to run the agent on, by display name or id (see `multica runtime
               list`). Null uses the sole runtime, and fails if there is more than one.
@@ -833,27 +774,22 @@ in
           };
           model = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = "Model identifier (e.g. claude-sonnet-4-6). Null = runtime default.";
           };
           thinkingLevel = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = "Reasoning/effort level (runtime-specific, e.g. low|medium|high).";
           };
           visibility = lib.mkOption {
             type = lib.types.nullOr (lib.types.enum [ "private" "workspace" ]);
-            default = null;
             description = "Invocation visibility: private (owner) or workspace (all members).";
           };
           maxConcurrentTasks = lib.mkOption {
             type = lib.types.nullOr lib.types.ints.positive;
-            default = null;
             description = "Maximum concurrent runs (1-50). Null = server default.";
           };
           skills = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
             description = ''
               Skill names to assign to this agent (from `skills` or already in the
               workspace). The set is replaced to match on each reconcile.
@@ -861,17 +797,14 @@ in
           };
           customArgs = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
             description = "Custom CLI arguments for the agent's runtime.";
           };
           runtimeConfig = lib.mkOption {
             type = jsonFormat.type;
-            default = { };
             description = "Runtime config, serialised to JSON (the CLI's --runtime-config).";
           };
           customEnvFile = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = ''
               Path to a JSON file of custom env vars (secret material) read at reconcile
               time. Kept OUT of the Nix store — use an absolute path, not a `./file`.
@@ -879,7 +812,6 @@ in
           };
           mcpConfigFile = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = ''
               Path to a JSON MCP server config (often carries tokens) read at reconcile
               time. Kept OUT of the Nix store — use an absolute path, not a `./file`.
@@ -890,7 +822,6 @@ in
     };
 
     squads = lib.mkOption {
-      default = { };
       description = ''
         Declarative Multica squads, reconciled after agents. The attribute name is the
         squad's name. The workspace is fully owned by this config: declared squads are
@@ -901,25 +832,14 @@ in
         Note: archived squads cannot be restored via the CLI; re-declaring an archived
         squad name creates a new squad with the same name.
       '';
-      example = lib.literalExpression ''
-        {
-          delivery = {
-            description = "Ships the roadmap";
-            leader = "reviewer";
-            members.builder.role = "member";
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Squad description.";
           };
           instructions = lib.mkOption {
             type = lib.types.nullOr lib.types.lines;
-            default = null;
             description = "Squad instructions.";
           };
           leader = lib.mkOption {
@@ -927,12 +847,10 @@ in
             description = "Leader agent, by name or id (required).";
           };
           members = lib.mkOption {
-            default = { };
             description = "Squad members, keyed by agent name (excluding the leader).";
             type = lib.types.attrsOf (lib.types.submodule {
               options.role = lib.mkOption {
                 type = lib.types.str;
-                default = "member";
                 description = "Member's role in the squad.";
               };
             });
@@ -942,7 +860,6 @@ in
     };
 
     quickActions = lib.mkOption {
-      default = { };
       description = ''
         Declarative Multica quick actions — named prompts that dispatch to an agent or
         squad. Reconciled after agents/squads (so they can reference ones you declare).
@@ -951,19 +868,10 @@ in
 
         Quick actions have no CLI, so the reconciler drives the REST API directly.
       '';
-      example = lib.literalExpression ''
-        {
-          triage = {
-            prompt = "Triage this issue: label it and suggest next steps.";
-            assignee = "reviewer";   # an agent (or squad) name
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Quick action description.";
           };
           prompt = lib.mkOption {
@@ -976,12 +884,10 @@ in
           };
           assigneeType = lib.mkOption {
             type = lib.types.enum [ "agent" "squad" ];
-            default = "agent";
             description = "Whether `assignee` names an agent or a squad.";
           };
           visibility = lib.mkOption {
             type = lib.types.enum [ "private" "public" ];
-            default = "private";
             description = ''
               Who can trigger it: private (you) or public (all members). A public action
               requires its assignee agent to be public.
@@ -992,7 +898,6 @@ in
     };
 
     autopilots = lib.mkOption {
-      default = { };
       description = ''
         Declarative Multica autopilots — scheduled/triggered agent automations.
         Reconciled after agents/squads (so they can reference agents you declare).
@@ -1008,17 +913,6 @@ in
         managed manually with `multica autopilot trigger-add`. Declared triggers are
         upserted by label; triggers not declared are **deleted** (full ownership).
       '';
-      example = lib.literalExpression ''
-        {
-          "Nightly triage" = {
-            description = "Summarise and label new issues from the last day.";
-            agent = "reviewer";           # an agent name or id
-            mode = "create_issue";
-            issueTitleTemplate = "Triage {{date}}";
-            triggers.nightly = { cron = "0 9 * * *"; timezone = "Australia/Sydney"; };
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
@@ -1031,7 +925,6 @@ in
           };
           mode = lib.mkOption {
             type = lib.types.enum [ "create_issue" "run_only" ];
-            default = "run_only";
             description = ''
               Execution mode: `run_only` just runs the agent; `create_issue` files an
               issue for each run (see `issueTitleTemplate`).
@@ -1039,12 +932,10 @@ in
           };
           project = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = "Project id to associate runs/issues with. Null = none.";
           };
           issueTitleTemplate = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
-            default = null;
             description = ''
               Title template for issues created in `create_issue` mode. Only `{{date}}`
               (UTC, YYYY-MM-DD) is interpolated. Requires `mode = "create_issue"`.
@@ -1052,7 +943,6 @@ in
           };
           subscribers = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
             description = ''
               Members to notify for issues this autopilot creates, by name or user id.
               The set is replaced to match on each reconcile.
@@ -1060,11 +950,9 @@ in
           };
           status = lib.mkOption {
             type = lib.types.nullOr (lib.types.enum [ "active" "paused" ]);
-            default = null;
             description = "Desired status. Null leaves the server default / current value.";
           };
           triggers = lib.mkOption {
-            default = { };
             description = ''
               Schedule (cron) triggers, keyed by label (the label is the identity).
               Upserted on each reconcile; triggers not listed here are deleted.
@@ -1077,12 +965,10 @@ in
                 };
                 timezone = lib.mkOption {
                   type = lib.types.str;
-                  default = "UTC";
                   description = "IANA timezone the cron expression is evaluated in.";
                 };
                 enabled = lib.mkOption {
                   type = lib.types.bool;
-                  default = true;
                   description = "Whether the trigger is enabled.";
                 };
               };
@@ -1093,7 +979,6 @@ in
     };
 
     sandboxes = lib.mkOption {
-      default = { };
       description = ''
         Declarative isolated agent-runtime sandboxes. Attribute name is the sandbox name.
         Each sandbox runs in its own OCI container with Claude Code installed and a running
@@ -1102,19 +987,10 @@ in
 
         Process and filesystem isolation is provided by container boundaries.
       '';
-      example = lib.literalExpression ''
-        {
-          hello = {
-            extraPackages = [ pkgs.ripgrep ];
-            volumeMounts = [ "/var/lib/multica/sandboxes/hello:/app/workspace" ];
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           extraPackages = lib.mkOption {
             type = lib.types.listOf lib.types.package;
-            default = [ ];
             description = ''
               Additional Nix packages to install in this sandbox's image, combined with
               the module-level `sandboxExtraPackages` (e.g., [ pkgs.gh pkgs.jq ]).
@@ -1122,7 +998,6 @@ in
           };
           volumeMounts = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
             description = ''
               Docker-style bind mounts ("host:container" or "host:container:ro"), passed
               to the oci-container's volumes list for persistent workspace storage.
