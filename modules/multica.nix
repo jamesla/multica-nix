@@ -27,6 +27,81 @@ let
     '';
   };
 
+  sandboxEntrypoint = pkgs.writeTextFile {
+    name = "multica-sandbox-entrypoint";
+    executable = true;
+    text = ''
+      #!/bin/sh
+      set -eu
+
+      # Wait for backend health.
+      for _ in $(seq 1 60); do
+        if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+      done
+
+      # Bootstrap token in dev mode if not set.
+      if [ -z "''${MULTICA_TOKEN:-}" ]; then
+        if [ "''${MULTICA_DEV_MODE:-0}" = "1" ]; then
+          for _ in $(seq 1 6); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+              -d '{"email":"${cfg.devLoginEmail}"}' \
+              "''${MULTICA_SERVER_URL}/auth/send-code")
+            if [ "$status" = "200" ]; then break; fi
+            sleep 10
+          done
+          jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"email":"${cfg.devLoginEmail}","code":"${cfg.devVerificationCode}"}' \
+            "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
+          if [ -z "$jwt" ]; then
+            echo "multica-sandbox: dev login failed (no token in verify-code response)." >&2
+            exit 1
+          fi
+          export MULTICA_TOKEN="$jwt"
+        else
+          echo "multica-sandbox: MULTICA_TOKEN not set and not in dev mode; daemon will not register." >&2
+          exit 1
+        fi
+      fi
+
+      # Construct daemon command.
+      cmd="${lib.getExe cfg.package} daemon start --foreground"
+      [ -n "''${MULTICA_AGENT_RUNTIME_NAME:-}" ] && cmd="$cmd --runtime-name '$MULTICA_AGENT_RUNTIME_NAME'"
+      [ -n "''${MULTICA_DAEMON_DEVICE_NAME:-}" ] && cmd="$cmd --device-name '$MULTICA_DAEMON_DEVICE_NAME'"
+      [ -n "''${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" ] && cmd="$cmd --max-concurrent-tasks $MULTICA_DAEMON_MAX_CONCURRENT_TASKS"
+      [ -n "''${MULTICA_DAEMON_POLL_INTERVAL:-}" ] && cmd="$cmd --poll-interval $MULTICA_DAEMON_POLL_INTERVAL"
+      [ -n "''${MULTICA_DAEMON_HEARTBEAT_INTERVAL:-}" ] && cmd="$cmd --heartbeat-interval $MULTICA_DAEMON_HEARTBEAT_INTERVAL"
+      [ -n "''${MULTICA_AGENT_TIMEOUT:-}" ] && cmd="$cmd --agent-timeout $MULTICA_AGENT_TIMEOUT"
+      [ -n "''${MULTICA_WORKSPACES_ROOT:-}" ] && cmd="$cmd --workspaces-root $MULTICA_WORKSPACES_ROOT"
+
+      exec sh -c "$cmd"
+    '';
+  };
+
+  sandboxImage = pkgs.dockerTools.buildLayeredImage {
+    name = "multica-sandbox";
+    tag = "latest";
+    contents = [
+      pkgs.bash
+      pkgs.coreutils
+      pkgs.curl
+      pkgs.jq
+      pkgs.cacert
+      pkgs.git
+      cfg.package
+      pkgs.claude-code
+    ];
+    extraCommands = ''
+      mkdir -p app/bin app/workspace
+    '';
+    config = {
+      Entrypoint = [ "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint" ];
+      WorkingDir = "/app/workspace";
+    };
+  };
+
   jsonFormat = pkgs.formats.json { };
 
   bodyPath = name: entry:
@@ -555,6 +630,25 @@ in
       '';
     };
 
+    sandboxImage = lib.mkOption {
+      type = lib.types.str;
+      default = ""; # Will be set to the Nix-built image derivation by default
+      description = ''
+        OCI image reference for sandbox runtimes. By default, a Nix-built layered image
+        containing Claude Code, the multica CLI, and required dependencies. Can be overridden
+        with a custom image name/digest if desired.
+      '';
+    };
+
+    sandboxImageFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Optional pre-fetched sandbox image tarball to load instead of building from Nix.
+        Used similarly to `backendImageFile`.
+      '';
+    };
+
     database = {
       createLocally = lib.mkOption {
         type = lib.types.bool;
@@ -1015,119 +1109,302 @@ in
         };
       }));
     };
+
+    sandboxes = lib.mkOption {
+      default = { };
+      description = ''
+        Declarative isolated agent-runtime sandboxes. Attribute name is the sandbox name.
+        Each sandbox runs in its own OCI container with Claude Code installed and a running
+        `multica daemon`, which auto-registers as a runtime with the backend. Agents can then
+        reference sandboxes by name via their `runtime` field.
+
+        Process and filesystem isolation is provided by container boundaries; persistent
+        workspace storage is controlled per-sandbox via the `workspaceVolume` option.
+      '';
+      example = lib.literalExpression ''
+        {
+          isolated1 = {
+            runtimeName = "Sandbox (isolated1)";
+            maxConcurrentTasks = 2;
+          };
+          isolated2 = {
+            pollInterval = "30s";
+            workspacesRoot = "/sandbox-workspace";
+          };
+        }
+      '';
+      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+        options = {
+          deviceName = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Human-readable device name for the sandbox daemon (--device-name).
+              Null defaults to the sandbox attribute name.
+            '';
+          };
+          runtimeName = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Runtime display name, used by agents to reference this sandbox via their `runtime` field
+              (--runtime-name). Null defaults to the sandbox attribute name.
+            '';
+          };
+          maxConcurrentTasks = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.positive;
+            default = null;
+            description = "Maximum concurrent agent runs (--max-concurrent-tasks). Null = daemon default.";
+          };
+          pollInterval = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              How often the daemon polls the backend for work (Go duration, e.g. "10s").
+              Null = daemon default.
+            '';
+          };
+          heartbeatInterval = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              How often the daemon sends heartbeats to the backend (Go duration, e.g. "30s").
+              Null = daemon default.
+            '';
+          };
+          agentTimeout = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Absolute per-run wall-clock timeout (Go duration, e.g. "1h").
+              Null = daemon default (no cap).
+            '';
+          };
+          workspacesRoot = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Container-internal path where the daemon stores run workspaces
+              (--workspaces-root). Null = daemon default.
+            '';
+          };
+          image = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              OCI image name/digest for this sandbox (overrides the module's default sandboxImage).
+              Null = uses the module's Nix-built default.
+            '';
+          };
+          imageFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            description = ''
+              Path to a pre-built OCI image tarball (alternative to `image`).
+              Null = uses the module's default.
+            '';
+          };
+          environmentFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Path to a file (kept out of the Nix store) with env var overrides, such as
+              a custom MULTICA_TOKEN for this sandbox in non-dev mode. Null = uses module defaults.
+            '';
+          };
+          workspaceVolume = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Host path for persistent workspace storage (reserved for future use).
+              Currently a no-op placeholder; will be wired to a bind mount in a follow-up change.
+            '';
+          };
+          extraArgs = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Additional arguments to pass to `multica daemon start` (for flags not yet modeled).
+            '';
+          };
+          extraOptions = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Additional options to pass to the underlying oci-container (e.g., ``--cap-add``, ``--device``).
+            '';
+          };
+        };
+      }));
+    };
   };
 
-  config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ]
-      ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) cfg.desktopPackage;
+  config = lib.mkIf cfg.enable
+    {
+      # Use the Nix-built sandbox image if sandboxes are declared and no custom image is set.
+      services.multica.sandboxImage = lib.mkDefault (
+        if cfg.sandboxes != { } && cfg.sandboxImage == ""
+        then "${sandboxImage}"
+        else cfg.sandboxImage
+      );
 
-    services.postgresql = lib.mkIf cfg.database.createLocally {
-      enable = true;
-      package = pkgs.postgresql_17;
-      extensions = ps: [ ps.pgvector ];
-      ensureDatabases = [ cfg.database.name ];
-      ensureUsers = [{
-        name = cfg.database.user;
-        ensureDBOwnership = true;
-      }];
-      authentication = lib.mkAfter ''
-        host ${cfg.database.name} ${cfg.database.user} 127.0.0.1/32 trust
-        host ${cfg.database.name} ${cfg.database.user} ::1/128      trust
-      '';
-    };
+      environment.systemPackages = [ cfg.package ]
+        ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) cfg.desktopPackage;
 
-    systemd.services.multica-db-init = lib.mkIf cfg.database.createLocally {
-      description = "Create pgvector extension for Multica";
-      after = [ "postgresql.service" "postgresql-setup.service" ];
-      requires = [ "postgresql.service" ];
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        Type = "oneshot";
-        User = "postgres";
-        RemainAfterExit = true;
+      services.postgresql = lib.mkIf cfg.database.createLocally {
+        enable = true;
+        package = pkgs.postgresql_17;
+        extensions = ps: [ ps.pgvector ];
+        ensureDatabases = [ cfg.database.name ];
+        ensureUsers = [{
+          name = cfg.database.user;
+          ensureDBOwnership = true;
+        }];
+        authentication = lib.mkAfter ''
+          host ${cfg.database.name} ${cfg.database.user} 127.0.0.1/32 trust
+          host ${cfg.database.name} ${cfg.database.user} ::1/128      trust
+        '';
       };
-      script = ''
-        ${config.services.postgresql.package}/bin/psql -d ${cfg.database.name} \
-          -tAc "CREATE EXTENSION IF NOT EXISTS vector;"
-      '';
-    };
 
-    systemd.tmpfiles.rules = [
-      "d /var/lib/multica 0750 root root -"
-      "d /var/lib/multica/uploads 0750 root root -"
-      "d /var/lib/multica/secrets 0700 root root -"
-      "f /var/lib/multica/env 0644 root root -"
-    ];
+      systemd.services.multica-db-init = lib.mkIf cfg.database.createLocally {
+        description = "Create pgvector extension for Multica";
+        after = [ "postgresql.service" "postgresql-setup.service" ];
+        requires = [ "postgresql.service" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          User = "postgres";
+          RemainAfterExit = true;
+        };
+        script = ''
+          ${config.services.postgresql.package}/bin/psql -d ${cfg.database.name} \
+            -tAc "CREATE EXTENSION IF NOT EXISTS vector;"
+        '';
+      };
 
-    virtualisation.oci-containers.backend = "docker";
-
-    virtualisation.oci-containers.containers.multica-backend = {
-      image = cfg.backendImage;
-      imageFile = cfg.backendImageFile;
-      entrypoint = "/entrypoint-wrapper.sh";
-      environment = {
-        DATABASE_URL = databaseUrl;
-        PORT = toString cfg.backendPort;
-      } // lib.optionalAttrs cfg.devMode {
-        APP_ENV = "development";
-        MULTICA_DEV_VERIFICATION_CODE = cfg.devVerificationCode;
-      } // cfg.extraBackendEnvironment;
-      environmentFiles = [ cfg.environmentFile ];
-      volumes = [
-        "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
-        "/var/lib/multica/secrets:/app/secrets"
-        "/var/lib/multica/uploads:/app/data/uploads"
+      systemd.tmpfiles.rules = [
+        "d /var/lib/multica 0750 root root -"
+        "d /var/lib/multica/uploads 0750 root root -"
+        "d /var/lib/multica/secrets 0700 root root -"
+        "f /var/lib/multica/env 0644 root root -"
       ];
-      extraOptions = [ "--network=host" ];
-    };
 
-    systemd.services.docker-multica-backend = {
-      after = [ "postgresql.service" "multica-db-init.service" ];
-      requires = [ "postgresql.service" "multica-db-init.service" ];
-    };
+      virtualisation.oci-containers.backend = "docker";
 
-    networking.firewall.allowedTCPPorts =
-      lib.mkIf cfg.openFirewall [ cfg.backendPort ];
+      virtualisation.oci-containers.containers =
+        {
+          multica-backend = {
+            image = cfg.backendImage;
+            imageFile = cfg.backendImageFile;
+            entrypoint = "/entrypoint-wrapper.sh";
+            environment = {
+              DATABASE_URL = databaseUrl;
+              PORT = toString cfg.backendPort;
+            } // lib.optionalAttrs cfg.devMode {
+              APP_ENV = "development";
+              MULTICA_DEV_VERIFICATION_CODE = cfg.devVerificationCode;
+            } // cfg.extraBackendEnvironment;
+            environmentFiles = [ cfg.environmentFile ];
+            volumes = [
+              "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
+              "/var/lib/multica/secrets:/app/secrets"
+              "/var/lib/multica/uploads:/app/data/uploads"
+            ];
+            extraOptions = [ "--network=host" ];
+          };
+        } // lib.mapAttrs'
+          (name: sandbox:
+            lib.nameValuePair "multica-sandbox-${name}" {
+              image =
+                if sandbox.image != null && sandbox.image != "" then sandbox.image
+                else if cfg.sandboxImage != "" then cfg.sandboxImage
+                else "multica-sandbox:latest";
+              imageFile = if sandbox.imageFile != null then sandbox.imageFile else cfg.sandboxImageFile;
+              entrypoint = "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint";
+              environment = {
+                MULTICA_SERVER_URL = backendUrl;
+                MULTICA_DEV_MODE = if cfg.devMode then "1" else "0";
+              } // lib.optionalAttrs (sandbox.deviceName != null) {
+                MULTICA_DAEMON_DEVICE_NAME = sandbox.deviceName;
+              } // lib.optionalAttrs (sandbox.deviceName == null) {
+                MULTICA_DAEMON_DEVICE_NAME = name;
+              } // lib.optionalAttrs (sandbox.runtimeName != null) {
+                MULTICA_AGENT_RUNTIME_NAME = sandbox.runtimeName;
+              } // lib.optionalAttrs (sandbox.runtimeName == null) {
+                MULTICA_AGENT_RUNTIME_NAME = name;
+              } // lib.optionalAttrs (sandbox.maxConcurrentTasks != null) {
+                MULTICA_DAEMON_MAX_CONCURRENT_TASKS = toString sandbox.maxConcurrentTasks;
+              } // lib.optionalAttrs (sandbox.pollInterval != null) {
+                MULTICA_DAEMON_POLL_INTERVAL = sandbox.pollInterval;
+              } // lib.optionalAttrs (sandbox.heartbeatInterval != null) {
+                MULTICA_DAEMON_HEARTBEAT_INTERVAL = sandbox.heartbeatInterval;
+              } // lib.optionalAttrs (sandbox.agentTimeout != null) {
+                MULTICA_AGENT_TIMEOUT = sandbox.agentTimeout;
+              } // lib.optionalAttrs (sandbox.workspacesRoot != null) {
+                MULTICA_WORKSPACES_ROOT = sandbox.workspacesRoot;
+              };
+              environmentFiles = lib.optional (sandbox.environmentFile != null) sandbox.environmentFile;
+              extraOptions = [ "--network=host" ] ++ sandbox.extraOptions;
+            }
+          )
+          cfg.sandboxes;
 
-    assertions =
-      lib.mapAttrsToList
-        (name: skill: {
-          assertion = (skill.text == null) != (skill.source == null);
-          message = "services.multica.skills.${name}: set exactly one of `text` or `source`.";
-        })
-        cfg.skills
-      ++ lib.concatLists (lib.mapAttrsToList
-        (name: skill: lib.mapAttrsToList
-          (path: file: {
-            assertion = (file.text == null) != (file.source == null);
-            message = ''services.multica.skills.${name}.files."${path}": set exactly one of `text` or `source`.'';
-          })
-          skill.files)
-        cfg.skills)
-      ++ lib.mapAttrsToList
-        (title: ap: {
-          assertion = ap.issueTitleTemplate == null || ap.mode == "create_issue";
-          message = ''services.multica.autopilots."${title}": `issueTitleTemplate` requires `mode = "create_issue"`.'';
-        })
-        cfg.autopilots;
-
-    systemd.services.multica-reconcile = {
-      description = "Reconcile declarative Multica resources (prunes undeclared ones)";
-      after = [ "docker-multica-backend.service" ];
-      requires = [ "docker-multica-backend.service" ];
-      wantedBy = [ "multi-user.target" ];
-      restartTriggers = [ reconcileManifest ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        EnvironmentFile = cfg.environmentFile;
-        StateDirectory = "multica-reconcile";
-        Environment = [
-          "HOME=%S/multica-reconcile"
-          "MULTICA_SERVER_URL=${backendUrl}"
-        ] ++ lib.optional (cfg.workspaceId != null) "MULTICA_WORKSPACE_ID=${cfg.workspaceId}";
+      systemd.services.docker-multica-backend = {
+        after = [ "postgresql.service" "multica-db-init.service" ];
+        requires = [ "postgresql.service" "multica-db-init.service" ];
       };
-      script = "${lib.getExe reconcile} ${reconcileManifest}";
-    };
+
+      networking.firewall.allowedTCPPorts =
+        lib.mkIf cfg.openFirewall [ cfg.backendPort ];
+
+      assertions =
+        lib.mapAttrsToList
+          (name: skill: {
+            assertion = (skill.text == null) != (skill.source == null);
+            message = "services.multica.skills.${name}: set exactly one of `text` or `source`.";
+          })
+          cfg.skills
+        ++ lib.concatLists (lib.mapAttrsToList
+          (name: skill: lib.mapAttrsToList
+            (path: file: {
+              assertion = (file.text == null) != (file.source == null);
+              message = ''services.multica.skills.${name}.files."${path}": set exactly one of `text` or `source`.'';
+            })
+            skill.files)
+          cfg.skills)
+        ++ lib.mapAttrsToList
+          (title: ap: {
+            assertion = ap.issueTitleTemplate == null || ap.mode == "create_issue";
+            message = ''services.multica.autopilots."${title}": `issueTitleTemplate` requires `mode = "create_issue"`.'';
+          })
+          cfg.autopilots;
+
+      systemd.services.multica-reconcile = {
+        description = "Reconcile declarative Multica resources (prunes undeclared ones)";
+        after = [ "docker-multica-backend.service" ];
+        requires = [ "docker-multica-backend.service" ];
+        wantedBy = [ "multi-user.target" ];
+        restartTriggers = [ reconcileManifest ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          EnvironmentFile = cfg.environmentFile;
+          StateDirectory = "multica-reconcile";
+          Environment = [
+            "HOME=%S/multica-reconcile"
+            "MULTICA_SERVER_URL=${backendUrl}"
+          ] ++ lib.optional (cfg.workspaceId != null) "MULTICA_WORKSPACE_ID=${cfg.workspaceId}";
+        };
+        script = "${lib.getExe reconcile} ${reconcileManifest}";
+      };
+    } // lib.mkIf (cfg.sandboxes != { }) {
+    systemd.services = lib.mapAttrs'
+      (name: _sandbox:
+        lib.nameValuePair "docker-multica-sandbox-${name}" {
+          after = [ "docker-multica-backend.service" ];
+          requires = [ "docker-multica-backend.service" ];
+        }
+      )
+      cfg.sandboxes;
   };
 }

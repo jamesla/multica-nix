@@ -1,7 +1,8 @@
 # multica-nix
 
-Install and configure a self-hosted [Multica](https://github.com/multica-ai/multica)
-server declaratively with Nix. Change the config, rebuild, and the running system follows.
+Install and configure a self-hosted [ Multica ] (https://github.com/multica-ai/multica)
+  server
+  declaratively with Nix. Change the config, rebuild, and the running system follows.
 
 Stand up the server (backend + database), put the CLI and desktop app on PATH, and
 declare *skills* that are reconciled into the workspace on rebuild. Clients talk to the
@@ -11,49 +12,49 @@ backend API directly — there is no browser web frontend.
 
 - `packages.<system>.multica-cli` — the Multica CLI (prebuilt static binary, v0.4.41).
 - `nixosModules.multica` — a NixOS module (`services.multica`) that runs the published
-  backend image (`ghcr.io/multica-ai/multica-backend`, digest-pinned) via docker, and
-  provisions PostgreSQL 17 + pgvector natively.
+backend image (`ghcr.io/multica-ai/multica-backend`, digest-pinned) via docker, and
+provisions PostgreSQL 17 + pgvector natively.
 
 ## Quick start (NixOS)
 
 1. Add the flake as an input and import the module:
 
-   ```nix
-   {
-     inputs.multica.url = "github:youruser/multica-nix"; # or path:/home/james/multica-nix
+```nix
+{
+inputs.multica.url = "github:youruser/multica-nix"; # or path:/home/james/multica-nix
 
-     outputs = { nixpkgs, multica, ... }: {
-       nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-         modules = [
-           multica.nixosModules.multica
-           ./configuration.nix
-         ];
-       };
-     };
-   }
-   ```
+outputs = { nixpkgs, multica, ... }: {
+nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+modules = [
+multica.nixosModules.multica
+./configuration.nix
+];
+};
+};
+}
+```
 
 2. Create a secret env file **outside the Nix store** (root-only) with a strong JWT secret:
 
-   ```bash
-   sudo install -Dm600 /dev/stdin /var/lib/multica/secret.env <<EOF
-   JWT_SECRET=$(openssl rand -hex 32)
-   EOF
-   ```
+```bash
+sudo install -Dm600 /dev/stdin /var/lib/multica/secret.env <<EOF
+JWT_SECRET=$(openssl rand -hex 32)
+EOF
+```
 
 3. Enable the service:
 
-   ```nix
-   services.multica = {
-     enable = true;
-     environmentFile = "/var/lib/multica/secret.env";
-     # host = "multica.example.com";   # if you reach it from another machine
-     # openFirewall = true;            # to expose the backend beyond localhost
-   };
-   ```
+```nix
+services.multica = {
+enable = true;
+environmentFile = "/var/lib/multica/secret.env";
+# host = "multica.example.com";   # if you reach it from another machine
+# openFirewall = true;            # to expose the backend beyond localhost
+};
+```
 
 4. `sudo nixos-rebuild switch`, then launch the desktop app (`multica-desktop`). The backend
-   health check is at <http://localhost:8080/health>.
+health check is at <http://localhost:8080/health>.
 
 ## Logging in
 
@@ -103,8 +104,8 @@ Any of Multica's optional integrations go through `extraBackendEnvironment`, e.g
 
 ```nix
 services.multica.extraBackendEnvironment = {
-  RESEND_API_KEY = "..."; # better: put secrets in environmentFile instead
-  ALLOWED_EMAIL_DOMAINS = "example.com";
+RESEND_API_KEY = "..."; # better: put secrets in environmentFile instead
+ALLOWED_EMAIL_DOMAINS = "example.com";
 };
 ```
 
@@ -125,18 +126,18 @@ identity. On rebuild the `multica-reconcile` service reconciles them into the wo
 
 ```nix
 services.multica.skills = {
-  pr-review = {
-    description = "How we review pull requests";
-    text = ''
+pr-review = {
+description = "How we review pull requests";
+text = ''
       # PR review
       Check tests, scope, and a rollback plan before approving.
     '';
-    # optional: settings = { model = "opus"; };  # -> the CLI's --config JSON
-    # optional extra files bundled with the skill:
-    # files."reference.md".source = ./skills/pr-review-reference.md;
-  };
+# optional: settings = { model = "opus"; };  # -> the CLI's --config JSON
+# optional extra files bundled with the skill:
+# files."reference.md".source = ./skills/pr-review-reference.md;
+};
 
-  lender-list.source = ./skills/lender-list.md;  # body straight from a file
+lender-list.source = ./skills/lender-list.md;  # body straight from a file
 };
 ```
 
@@ -148,12 +149,12 @@ keyed by their path within the skill, each also `text` or `source`).
 gets one **automatically**, so declaring a skill and rebuilding just works:
 
 - In `devMode` (the default) the reconciler logs in with the fixed code as `devLoginEmail`
-  (default `admin@multica.local`), creates a workspace if none exists, and pushes your skills.
-  **Log in to the desktop app with that same email** to see the workspace and skills it manages.
+(default `admin@multica.local`), creates a workspace if none exists, and pushes your skills.
+**Log in to the desktop app with that same email** to see the workspace and skills it manages.
 - To target a real (non-dev) backend, set `devMode = false` and provide a personal access token
-  (**Settings → Tokens**, a `mul_…` token) in `environmentFile` as `MULTICA_TOKEN=mul_…`. A
-  supplied `MULTICA_TOKEN` always takes precedence over dev login. Without a token and outside
-  dev mode the reconciler logs a notice and skips — it never fails the rebuild.
+(**Settings → Tokens**, a `mul_…` token) in `environmentFile` as `MULTICA_TOKEN=mul_…`. A
+supplied `MULTICA_TOKEN` always takes precedence over dev login. Without a token and outside
+dev mode the reconciler logs a notice and skips — it never fails the rebuild.
 
 If the identity can see more than one workspace, set `services.multica.workspaceId`.
 
@@ -169,25 +170,27 @@ a new one.
 
 ```nix
 services.multica.agents.reviewer = {
-  description = "Reviews pull requests";
-  runtime = "Claude (myhost)";        # runtime name or id; omit if only one exists
-  model = "claude-sonnet-4-6";
-  instructions = ''Be thorough and terse.'';
-  skills = [ "pr-review" ];           # skill names → assigned to the agent
+description = "Reviews pull requests";
+runtime = "Claude (myhost)";        # runtime name or id; omit if only one exists
+model = "claude-sonnet-4-6";
+instructions = ''Be thorough and terse.'';
+skills = [ "pr-review" ];           # skill names → assigned to the agent
 };
 
 services.multica.squads.delivery = {
-  description = "Ships the roadmap";
-  leader = "reviewer";                # agent name or id (auto-added as a member)
-  members.builder.role = "member";    # keyed by agent name; leader excluded
+description = "Ships the roadmap";
+leader = "reviewer";                # agent name or id (auto-added as a member)
+members.builder.role = "member";    # keyed by agent name; leader excluded
 };
 ```
 
-**Runtimes.** An agent must run on a runtime, and runtimes aren't declarative — they register
-when a `multica daemon` runs. Reference one by name/id with `runtime` (`multica runtime list`);
+**Runtimes.** An agent must run on a runtime. Runtimes can now be made **declarative** via the
+`sandboxes` option (see below), which spins up isolated containerized daemons that self-register.
+Alternatively, manually run `multica daemon start` elsewhere (e.g., your dev machine) to register
+it as a runtime. Reference a runtime by name/id with the `runtime` field (see `multica runtime list`);
 if the workspace has exactly one it's used automatically. **If no runtime exists, agents and
-squads are skipped** (the reconciler logs a notice and still does skills) so a box without a
-daemon still rebuilds.
+squads are skipped** (the reconciler logs a notice and still does skills) so a rebuild succeeds
+even without any runtime available.
 
 **Secrets.** An agent's custom env vars and MCP config often carry API tokens, so they're passed
 as **file paths read at reconcile time**, kept out of the world-readable Nix store — give an
@@ -195,13 +198,59 @@ absolute path, not a `./file`:
 
 ```nix
 services.multica.agents.reviewer = {
-  runtime = "Claude (myhost)";
-  customEnvFile = "/var/lib/multica/reviewer.env.json";   # {"KEY":"value"}
-  mcpConfigFile = "/var/lib/multica/reviewer.mcp.json";   # {"mcpServers":{…}}
+runtime = "Claude (myhost)";
+customEnvFile = "/var/lib/multica/reviewer.env.json";   # {"KEY":"value"}
+mcpConfigFile = "/var/lib/multica/reviewer.mcp.json";   # {"mcpServers":{…}}
 };
 ```
 
 Non-secret bits (`instructions`, `model`, `runtimeConfig`, `customArgs`) are fine inline.
+
+## Declarative sandboxes
+
+Sandboxes let you run declarative, isolated agent-runtime containers. Each sandbox runs its own
+`multica daemon` in a dedicated OCI container with Claude Code installed, automatically registering
+as a runtime with the backend on startup. This provides **process isolation** (a crashing agent
+run can't touch the host or other sandboxes) and **filesystem isolation** (each sandbox has its
+own workspace).
+
+Declare sandboxes alongside agents:
+
+```nix
+services.multica.sandboxes.isolated1 = {
+runtimeName = "Sandbox (isolated1)";     # agents reference this via runtime = "Sandbox (isolated1)"
+maxConcurrentTasks = 2;                  # optional: parallel agent runs (default: daemon's choice)
+pollInterval = "10s";                    # optional: how often daemon checks for work (default: daemon's choice)
+# workspacesRoot = "/sandbox-ws";        # optional: container-internal workspace dir
+};
+
+services.multica.sandboxes.isolated2 = {
+runtimeName = "Sandbox (isolated2)";
+deviceName = "my-sandbox-2";             # optional: daemon's human-readable device name
+agentTimeout = "30m";                    # optional: max run time
+};
+```
+
+Then agents can reference them:
+
+```nix
+services.multica.agents.reviewer = {
+description = "Code reviewer";
+runtime = "Sandbox (isolated1)";         # references the declared sandbox
+model = "claude-opus-5";
+instructions = "Be thorough and terse.";
+skills = [ "pr-review" ];
+};
+```
+
+**Image & auth.** By default, sandboxes use a Nix-built OCI image containing Claude Code, the
+multica CLI, bash, and git. In **dev mode** (`devMode = true`), each sandbox auto-authenticates
+with the backend using the same auto-login flow as the reconciler. In production, provide a
+`MULTICA_TOKEN` via the sandbox's `environmentFile` option (a path kept out of the store, similar
+to agent `customEnvFile`).
+
+**Persistence.** A `workspaceVolume` option is available for specifying a host path for persistent
+storage; this is reserved for future use and not yet wired into the container.
 
 ## Declarative quick actions
 
@@ -212,11 +261,11 @@ this config: declared actions are created or updated; quick actions not declared
 
 ```nix
 services.multica.quickActions.triage = {
-  description = "Triage an issue";
-  prompt = ''Triage this issue: label it and suggest next steps.'';
-  assignee = "reviewer";        # an agent (default) or squad name/id
-  # assigneeType = "squad";     # if the assignee is a squad
-  # visibility = "public";      # default "private"
+description = "Triage an issue";
+prompt = ''Triage this issue: label it and suggest next steps.'';
+assignee = "reviewer";        # an agent (default) or squad name/id
+# assigneeType = "squad";     # if the assignee is a squad
+# visibility = "public";      # default "private"
 };
 ```
 
@@ -237,16 +286,16 @@ here are **deleted** on the next rebuild.
 
 ```nix
 services.multica.autopilots."Nightly triage" = {
-  description = "Summarise and label new issues from the last day.";  # used as the run prompt
-  agent = "reviewer";                    # assignee agent, by name or id
-  mode = "create_issue";                 # or "run_only" (default)
-  issueTitleTemplate = "Triage {{date}}"; # create_issue only; only {{date}} is interpolated
-  # project = "…"; subscribers = [ "alice" ]; status = "active";  # all optional
-  triggers.nightly = {
-    cron = "0 9 * * *";
-    timezone = "Australia/Sydney";       # default "UTC"
-    # enabled = false;                   # default true
-  };
+description = "Summarise and label new issues from the last day.";  # used as the run prompt
+agent = "reviewer";                    # assignee agent, by name or id
+mode = "create_issue";                 # or "run_only" (default)
+issueTitleTemplate = "Triage {{date}}"; # create_issue only; only {{date}} is interpolated
+# project = "…"; subscribers = [ "alice" ]; status = "active";  # all optional
+triggers.nightly = {
+cron = "0 9 * * *";
+timezone = "Australia/Sydney";       # default "UTC"
+# enabled = false;                   # default true
+};
 };
 ```
 
