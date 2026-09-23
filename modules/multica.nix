@@ -66,22 +66,14 @@ let
         fi
       fi
 
-      # Construct daemon command.
-      cmd="${lib.getExe cfg.package} daemon start --foreground"
-      [ -n "''${MULTICA_AGENT_RUNTIME_NAME:-}" ] && cmd="$cmd --runtime-name '$MULTICA_AGENT_RUNTIME_NAME'"
-      [ -n "''${MULTICA_DAEMON_DEVICE_NAME:-}" ] && cmd="$cmd --device-name '$MULTICA_DAEMON_DEVICE_NAME'"
-      [ -n "''${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" ] && cmd="$cmd --max-concurrent-tasks $MULTICA_DAEMON_MAX_CONCURRENT_TASKS"
-      [ -n "''${MULTICA_DAEMON_POLL_INTERVAL:-}" ] && cmd="$cmd --poll-interval $MULTICA_DAEMON_POLL_INTERVAL"
-      [ -n "''${MULTICA_DAEMON_HEARTBEAT_INTERVAL:-}" ] && cmd="$cmd --heartbeat-interval $MULTICA_DAEMON_HEARTBEAT_INTERVAL"
-      [ -n "''${MULTICA_AGENT_TIMEOUT:-}" ] && cmd="$cmd --agent-timeout $MULTICA_AGENT_TIMEOUT"
-      [ -n "''${MULTICA_WORKSPACES_ROOT:-}" ] && cmd="$cmd --workspaces-root $MULTICA_WORKSPACES_ROOT"
-
-      exec sh -c "$cmd"
+      exec ${lib.getExe cfg.package} daemon start --foreground \
+        --device-name "$MULTICA_DAEMON_DEVICE_NAME" \
+        --runtime-name "$MULTICA_AGENT_RUNTIME_NAME"
     '';
   };
 
-  sandboxImage = pkgs.dockerTools.buildLayeredImage {
-    name = "multica-sandbox";
+  mkSandboxImage = name: extraPkgs: pkgs.dockerTools.buildLayeredImage {
+    name = "multica-sandbox-${name}";
     tag = "latest";
     contents = [
       pkgs.bash
@@ -92,7 +84,7 @@ let
       pkgs.git
       cfg.package
       pkgs.claude-code
-    ];
+    ] ++ cfg.sandboxExtraPackages ++ extraPkgs;
     extraCommands = ''
       mkdir -p app/bin app/workspace
     '';
@@ -630,22 +622,12 @@ in
       '';
     };
 
-    sandboxImage = lib.mkOption {
-      type = lib.types.str;
-      default = ""; # Will be set to the Nix-built image derivation by default
+    sandboxExtraPackages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
       description = ''
-        OCI image reference for sandbox runtimes. By default, a Nix-built layered image
-        containing Claude Code, the multica CLI, and required dependencies. Can be overridden
-        with a custom image name/digest if desired.
-      '';
-    };
-
-    sandboxImageFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      description = ''
-        Optional pre-fetched sandbox image tarball to load instead of building from Nix.
-        Used similarly to `backendImageFile`.
+        Extra Nix packages to install in every sandbox container (e.g. [ pkgs.ripgrep pkgs.gh ]).
+        Combined with per-sandbox `extraPackages` when building sandbox images.
       '';
     };
 
@@ -1118,136 +1100,41 @@ in
         `multica daemon`, which auto-registers as a runtime with the backend. Agents can then
         reference sandboxes by name via their `runtime` field.
 
-        Process and filesystem isolation is provided by container boundaries; persistent
-        workspace storage is controlled per-sandbox via the `workspaceVolume` option.
+        Process and filesystem isolation is provided by container boundaries.
       '';
       example = lib.literalExpression ''
         {
-          isolated1 = {
-            runtimeName = "Sandbox (isolated1)";
-            maxConcurrentTasks = 2;
-          };
-          isolated2 = {
-            pollInterval = "30s";
-            workspacesRoot = "/sandbox-workspace";
+          hello = {
+            extraPackages = [ pkgs.ripgrep ];
+            volumeMounts = [ "/var/lib/multica/sandboxes/hello:/app/workspace" ];
           };
         }
       '';
-      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+      type = lib.types.attrsOf (lib.types.submodule {
         options = {
-          deviceName = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
+          extraPackages = lib.mkOption {
+            type = lib.types.listOf lib.types.package;
+            default = [ ];
             description = ''
-              Human-readable device name for the sandbox daemon (--device-name).
-              Null defaults to the sandbox attribute name.
+              Additional Nix packages to install in this sandbox's image, combined with
+              the module-level `sandboxExtraPackages` (e.g., [ pkgs.gh pkgs.jq ]).
             '';
           };
-          runtimeName = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Runtime display name, used by agents to reference this sandbox via their `runtime` field
-              (--runtime-name). Null defaults to the sandbox attribute name.
-            '';
-          };
-          maxConcurrentTasks = lib.mkOption {
-            type = lib.types.nullOr lib.types.ints.positive;
-            default = null;
-            description = "Maximum concurrent agent runs (--max-concurrent-tasks). Null = daemon default.";
-          };
-          pollInterval = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              How often the daemon polls the backend for work (Go duration, e.g. "10s").
-              Null = daemon default.
-            '';
-          };
-          heartbeatInterval = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              How often the daemon sends heartbeats to the backend (Go duration, e.g. "30s").
-              Null = daemon default.
-            '';
-          };
-          agentTimeout = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Absolute per-run wall-clock timeout (Go duration, e.g. "1h").
-              Null = daemon default (no cap).
-            '';
-          };
-          workspacesRoot = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Container-internal path where the daemon stores run workspaces
-              (--workspaces-root). Null = daemon default.
-            '';
-          };
-          image = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              OCI image name/digest for this sandbox (overrides the module's default sandboxImage).
-              Null = uses the module's Nix-built default.
-            '';
-          };
-          imageFile = lib.mkOption {
-            type = lib.types.nullOr lib.types.path;
-            default = null;
-            description = ''
-              Path to a pre-built OCI image tarball (alternative to `image`).
-              Null = uses the module's default.
-            '';
-          };
-          environmentFile = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Path to a file (kept out of the Nix store) with env var overrides, such as
-              a custom MULTICA_TOKEN for this sandbox in non-dev mode. Null = uses module defaults.
-            '';
-          };
-          workspaceVolume = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Host path for persistent workspace storage (reserved for future use).
-              Currently a no-op placeholder; will be wired to a bind mount in a follow-up change.
-            '';
-          };
-          extraArgs = lib.mkOption {
+          volumeMounts = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
             description = ''
-              Additional arguments to pass to `multica daemon start` (for flags not yet modeled).
-            '';
-          };
-          extraOptions = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = ''
-              Additional options to pass to the underlying oci-container (e.g., ``--cap-add``, ``--device``).
+              Docker-style bind mounts ("host:container" or "host:container:ro"), passed
+              to the oci-container's volumes list for persistent workspace storage.
             '';
           };
         };
-      }));
+      });
     };
   };
 
   config = lib.mkIf cfg.enable
     {
-      # Use the Nix-built sandbox image if sandboxes are declared and no custom image is set.
-      services.multica.sandboxImage = lib.mkDefault (
-        if cfg.sandboxes != { } && cfg.sandboxImage == ""
-        then "${sandboxImage}"
-        else cfg.sandboxImage
-      );
-
       environment.systemPackages = [ cfg.package ]
         ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) cfg.desktopPackage;
 
@@ -1315,36 +1202,17 @@ in
         } // lib.mapAttrs'
           (name: sandbox:
             lib.nameValuePair "multica-sandbox-${name}" {
-              image =
-                if sandbox.image != null && sandbox.image != "" then sandbox.image
-                else if cfg.sandboxImage != "" then cfg.sandboxImage
-                else "multica-sandbox:latest";
-              imageFile = if sandbox.imageFile != null then sandbox.imageFile else cfg.sandboxImageFile;
+              image = "multica-sandbox-${name}:latest";
+              imageFile = mkSandboxImage name sandbox.extraPackages;
               entrypoint = "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint";
               environment = {
                 MULTICA_SERVER_URL = backendUrl;
                 MULTICA_DEV_MODE = if cfg.devMode then "1" else "0";
-              } // lib.optionalAttrs (sandbox.deviceName != null) {
-                MULTICA_DAEMON_DEVICE_NAME = sandbox.deviceName;
-              } // lib.optionalAttrs (sandbox.deviceName == null) {
                 MULTICA_DAEMON_DEVICE_NAME = name;
-              } // lib.optionalAttrs (sandbox.runtimeName != null) {
-                MULTICA_AGENT_RUNTIME_NAME = sandbox.runtimeName;
-              } // lib.optionalAttrs (sandbox.runtimeName == null) {
                 MULTICA_AGENT_RUNTIME_NAME = name;
-              } // lib.optionalAttrs (sandbox.maxConcurrentTasks != null) {
-                MULTICA_DAEMON_MAX_CONCURRENT_TASKS = toString sandbox.maxConcurrentTasks;
-              } // lib.optionalAttrs (sandbox.pollInterval != null) {
-                MULTICA_DAEMON_POLL_INTERVAL = sandbox.pollInterval;
-              } // lib.optionalAttrs (sandbox.heartbeatInterval != null) {
-                MULTICA_DAEMON_HEARTBEAT_INTERVAL = sandbox.heartbeatInterval;
-              } // lib.optionalAttrs (sandbox.agentTimeout != null) {
-                MULTICA_AGENT_TIMEOUT = sandbox.agentTimeout;
-              } // lib.optionalAttrs (sandbox.workspacesRoot != null) {
-                MULTICA_WORKSPACES_ROOT = sandbox.workspacesRoot;
               };
-              environmentFiles = lib.optional (sandbox.environmentFile != null) sandbox.environmentFile;
-              extraOptions = [ "--network=host" ] ++ sandbox.extraOptions;
+              volumes = sandbox.volumeMounts;
+              extraOptions = [ "--network=host" ];
             }
           )
           cfg.sandboxes;

@@ -211,46 +211,40 @@ Non-secret bits (`instructions`, `model`, `runtimeConfig`, `customArgs`) are fin
 Sandboxes let you run declarative, isolated agent-runtime containers. Each sandbox runs its own
 `multica daemon` in a dedicated OCI container with Claude Code installed, automatically registering
 as a runtime with the backend on startup. This provides **process isolation** (a crashing agent
-run can't touch the host or other sandboxes) and **filesystem isolation** (each sandbox has its
-own workspace).
+run can't touch the host or other sandboxes) and **filesystem isolation** via optional bind mounts.
 
-Declare sandboxes alongside agents:
+Declare sandboxes and add custom CLI tools:
 
 ```nix
-services.multica.sandboxes.isolated1 = {
-runtimeName = "Sandbox (isolated1)";     # agents reference this via runtime = "Sandbox (isolated1)"
-maxConcurrentTasks = 2;                  # optional: parallel agent runs (default: daemon's choice)
-pollInterval = "10s";                    # optional: how often daemon checks for work (default: daemon's choice)
-# workspacesRoot = "/sandbox-ws";        # optional: container-internal workspace dir
-};
+services.multica.sandboxExtraPackages = [ pkgs.ripgrep pkgs.gh ];
 
-services.multica.sandboxes.isolated2 = {
-runtimeName = "Sandbox (isolated2)";
-deviceName = "my-sandbox-2";             # optional: daemon's human-readable device name
-agentTimeout = "30m";                    # optional: max run time
+services.multica.sandboxes.hello = {
+extraPackages = [ pkgs.jq ];                    # just for this sandbox
+volumeMounts = [ "/srv/sandbox-storage:/app/workspace" ];
 };
 ```
 
-Then agents can reference them:
+Then agents reference them by their attribute name:
 
 ```nix
 services.multica.agents.reviewer = {
 description = "Code reviewer";
-runtime = "Sandbox (isolated1)";         # references the declared sandbox
+runtime = "hello";                              # matches the sandbox attribute name
 model = "claude-opus-5";
 instructions = "Be thorough and terse.";
 skills = [ "pr-review" ];
 };
 ```
 
-**Image & auth.** By default, sandboxes use a Nix-built OCI image containing Claude Code, the
-multica CLI, bash, and git. In **dev mode** (`devMode = true`), each sandbox auto-authenticates
-with the backend using the same auto-login flow as the reconciler. In production, provide a
-`MULTICA_TOKEN` via the sandbox's `environmentFile` option (a path kept out of the store, similar
-to agent `customEnvFile`).
+**Packages.** The Nix-built sandbox image comes with Claude Code, the multica CLI, bash, git,
+curl, jq, and cacert. Add more with `sandboxExtraPackages` (all sandboxes) or per-sandbox
+`extraPackages`.
 
-**Persistence.** A `workspaceVolume` option is available for specifying a host path for persistent
-storage; this is reserved for future use and not yet wired into the container.
+**Storage.** Use `volumeMounts` (docker-style `"host:container"` or `"host:container:ro"` bind
+mount specs) for persistent workspace directories and other shared filesystems.
+
+**Auth.** In **dev mode** (`devMode = true`), each sandbox auto-authenticates with the backend
+using the same auto-login flow as the reconciler.
 
 ## Declarative quick actions
 
