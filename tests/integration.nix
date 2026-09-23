@@ -40,9 +40,33 @@ pkgs.testers.runNixOSTest {
 
     services.multica = {
       enable = true;
+
+      package = pkgs.callPackage ../pkgs/multica-cli.nix { };
+      desktopPackage = pkgs.callPackage ../pkgs/multica-desktop.nix { serverUrl = "http://localhost:8080"; };
+      installDesktop = false;
+
+      host = "localhost";
+      backendPort = 8080;
+      openFirewall = false;
+
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
       backendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
+      extraBackendEnvironment = { };
+
+      database.createLocally = true;
+      database.name = "multica";
+      database.user = "multica";
+
+      devMode = true;
+      devVerificationCode = "888888";
+      devLoginEmail = "admin@multica.local";
+      workspaceName = "Test";
+      workspaceSlug = "test";
+      workspaceId = null;
+
+      sandboxExtraPackages = [ ];
+
       skills.pr-review = {
         description = "How we review PRs";
         text = ''
@@ -50,24 +74,51 @@ pkgs.testers.runNixOSTest {
           Check tests, scope, and a rollback plan.
         '';
       };
+
       agents.reviewer = {
         description = "Reviews PRs";
         instructions = "Be terse.";
+        runtime = null;
+        model = null;
+        thinkingLevel = null;
+        visibility = null;
+        maxConcurrentTasks = null;
         skills = [ "pr-review" ];
+        customArgs = [ ];
+        runtimeConfig = { };
+        customEnvFile = null;
+        mcpConfigFile = null;
       };
+
       squads.delivery = {
         description = "Ships the roadmap";
         leader = "reviewer";
       };
+
       quickActions.triage = {
+        description = "Triage issues";
         prompt = "Triage this issue.";
         assignee = "reviewer";
+        assigneeType = "agent";
+        visibility = "private";
       };
+
       autopilots.nightly = {
         description = "Summarise open issues each night.";
         agent = "reviewer";
-        triggers.nightly = { cron = "0 9 * * *"; };
+        mode = "run_only";
+        project = null;
+        issueTitleTemplate = null;
+        subscribers = [ ];
+        status = null;
+        triggers.nightly = {
+          cron = "0 9 * * *";
+          timezone = "UTC";
+          enabled = true;
+        };
       };
+
+      sandboxes = { };
     };
   };
 
