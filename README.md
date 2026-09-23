@@ -1,12 +1,11 @@
 # multica-nix
 
-Install and configure a self-hosted [ Multica ] (https://github.com/multica-ai/multica)
-  server
-  declaratively with Nix. Change the config, rebuild, and the running system follows.
+Install and configure a self-hosted [Multica](https://github.com/multica-ai/multica)
+server declaratively with Nix. Change the config, rebuild, and the running system follows.
 
 Stand up the server (backend + database), put the CLI and desktop app on PATH, and
-declare *skills* that are reconciled into the workspace on rebuild. Clients talk to the
-backend API directly — there is no browser web frontend.
+declare *skills*, *agents*, and *squads* that are reconciled into the workspace on rebuild.
+Clients talk to the backend API directly — there is no browser web frontend.
 
 ## What it gives you
 
@@ -34,270 +33,249 @@ multica.nixosModules.multica
 }
 ```
 
-2. Create a secret env file **outside the Nix store** (root-only) with a strong JWT secret:
-
-```bash
-sudo install -Dm600 /dev/stdin /var/lib/multica/secret.env <<EOF
-JWT_SECRET=$(openssl rand -hex 32)
-EOF
-```
-
-3. Enable the service:
+2. Enable and configure the service (see "Full configuration example" below for all options).
+Minimal setup:
 
 ```nix
 services.multica = {
 enable = true;
-environmentFile = "/var/lib/multica/secret.env";
-# host = "multica.example.com";   # if you reach it from another machine
-# openFirewall = true;            # to expose the backend beyond localhost
+environmentFile = "/var/lib/multica/env";
 };
 ```
 
-4. `sudo nixos-rebuild switch`, then launch the desktop app (`multica-desktop`). The backend
-health check is at <http://localhost:8080/health>.
+3. `sudo nixos-rebuild switch`, then launch the desktop app (`multica-desktop`).
+The backend health check is at `http://localhost:8080/health`.
 
 ## Logging in
 
 Multica login is passwordless — it emails a one-time code. This build runs the backend in
-development mode with a **fixed verification code**, so you can log in offline with no mail
-server configured. Use the desktop app (below); enter **any email address** and, when prompted
+**development mode** with a fixed verification code by default, so you can log in offline with
+no mail server configured. Use the desktop app; enter **any email address** and when prompted
 for the code, enter **`888888`**.
 
 The account is created automatically on first login. Mint a personal access token under
-**Settings → Tokens** and set it as `MULTICA_TOKEN` for the CLI/daemon.
+**Settings → Tokens** and set it as `MULTICA_TOKEN` in your `environmentFile` for the CLI/daemon.
 
 ### Desktop app
 
 The packaged `multica-desktop` is pre-pointed at this local instance: its launcher writes
-`~/.multica/desktop.json` (`apiUrl` → the backend, `wsUrl` → the backend websocket) on every
-start, so it never falls back to Multica cloud. Just launch it and sign in with any email +
-`888888`. If it was already open, fully quit and reopen it so it re-reads the config. (A one-off
-`desktop-*` profile for the old cloud server may linger under `~/.multica/profiles/`; it's harmless.)
+`~/.multica/desktop.json` on every start, so it never falls back to Multica cloud. Just
+launch it and sign in with any email + the dev code. If it was already open, fully quit
+and reopen it so it re-reads the config.
 
-> ⚠️ **Local/dev only.** The fixed code `888888` is valid for *any* email, so anyone who can
-> reach the backend can log in. This is only safe because the NixOS firewall is closed by
-> default and the port binds to loopback — never expose this build on an internet-facing host.
+> ⚠️ **Local/dev only.** The fixed code is valid for *any* email, so anyone who can reach
+> the backend can log in. This is only safe because the NixOS firewall is closed by default
+> and the port binds to loopback — never expose this build on an internet-facing host without
+> disabling `devMode`.
 
-## Configuration
+## Full configuration example
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `services.multica.enable` | `false` | Turn the server on. |
-| `services.multica.environmentFile` | *(required)* | Env file (KEY=VALUE) with `JWT_SECRET`; kept out of the store. |
-| `services.multica.host` | `"localhost"` | Public host used in the backend URL seeded into clients. |
-| `services.multica.backendPort` | `8080` | Backend API listen port. |
-| `services.multica.backendImage` | digest-pinned v0.4.41 | Override to change version. |
-| `services.multica.database.{name,user,createLocally}` | `multica` / `multica` / `true` | Native Postgres provisioning. |
-| `services.multica.extraBackendEnvironment` | `{}` | Optional backend vars (S3, GitHub app, OAuth, Slack, SMTP/Resend, LLM assist, ...). |
-| `services.multica.openFirewall` | `false` | Open the backend port in the firewall. |
-| `services.multica.installDesktop` | `true` | Put the desktop client on PATH (Linux only); set false for headless/CLI-only. |
-| `services.multica.skills` | `{}` | Declarative skills reconciled into the workspace (see below). |
-| `services.multica.agents` | `{}` | Declarative agents (need a runtime; see below). |
-| `services.multica.squads` | `{}` | Declarative squads of agents (see below). |
-| `services.multica.quickActions` | `{}` | Declarative quick actions (named prompts → agent/squad). |
-| `services.multica.autopilots` | `{}` | Declarative autopilots (scheduled agent automations; see below). |
-| `services.multica.devMode` | `true` | Dev backend: passwordless login + automatic skill token. Set false for production. |
-| `services.multica.devLoginEmail` | `"admin@multica.local"` | Identity the reconciler logs in as in dev mode (log into the app with the same email). |
-| `services.multica.workspaceId` | `null` | Workspace to reconcile skills into (defaults to the sole workspace, auto-created in dev). |
-
-Any of Multica's optional integrations go through `extraBackendEnvironment`, e.g.:
+Here is a complete `services.multica` block with every available option documented. Use this
+as a reference when building your config:
 
 ```nix
-services.multica.extraBackendEnvironment = {
-RESEND_API_KEY = "..."; # better: put secrets in environmentFile instead
-ALLOWED_EMAIL_DOMAINS = "example.com";
+services.multica = {
+  # == CORE ==
+  enable = true;                           # required: turn the service on
+
+  # == NETWORKING ==
+  host = "localhost";                      # optional; default: public host for clients
+  backendPort = 8080;                      # optional; default: backend API port
+  openFirewall = false;                    # optional; default: expose backend to network?
+
+  # == BACKEND IMAGE ==
+  backendImage = "ghcr.io/multica-ai/multica-backend@sha256:...";  # optional; override version
+  # backendImageFile = null;               # optional; pre-fetched image tarball (offline use)
+
+  # == DATABASE ==
+  database = {
+    createLocally = true;                  # optional; default: provision local PostgreSQL?
+    name = "multica";                      # optional; database name
+    user = "multica";                      # optional; database user
+  };
+
+  # == ENVIRONMENT & SECRETS ==
+  environmentFile = "/var/lib/multica/env";  # required; env file (JWT_SECRET, MULTICA_TOKEN, etc.)
+  extraBackendEnvironment = {              # optional; extra env vars for backend container
+    # S3_BUCKET = "my-bucket";
+    # GITHUB_APP_ID = "123456";
+    # ALLOWED_EMAIL_DOMAINS = "example.com";
+  };
+
+  # == DEV MODE ==
+  devMode = true;                          # optional; default: enable passwordless login
+  devVerificationCode = "888888";          # optional; fixed code for any email in dev mode
+  devLoginEmail = "admin@multica.local";   # optional; identity reconciler logs in as
+  workspaceName = "Default";               # optional; name of auto-created workspace in dev
+  workspaceSlug = "default";               # optional; slug of auto-created workspace in dev
+
+  # == WORKSPACE ==
+  workspaceId = null;                      # optional; target workspace id (auto-detect if null)
+
+  # == DESKTOP CLIENT ==
+  installDesktop = true;                   # optional; default: put desktop app on PATH (Linux)
+
+  # == DECLARATIVE SKILLS ==
+  # Skills are reconciled to match this config exactly: declared skills are created/updated,
+  # undeclared skills are deleted. Reconciliation needs a token (MULTICA_TOKEN in environmentFile
+  # in production, or auto-login in devMode). Skills → agents → squads reconcile in order.
+  skills = {
+    pr-review = {
+      description = "Code review process";
+      text = ''
+        # Pull Request Review
+
+        Check the following before approving:
+        - Tests pass
+        - Scope is well-defined
+        - Rollback plan exists
+      '';
+      # settings = { model = "opus"; };   # optional; skill-specific config (JSON)
+      # files."reference.md".text = "...";  # optional; extra files keyed by path
+      # files."checklist.md".source = ./checklist.md;
+    };
+
+    linting-rules = {
+      # description = "";                 # optional; default: empty
+      source = ./skills/linting-rules.md;  # load body from file instead of inline text
+    };
+  };
+
+  # == DECLARATIVE AGENTS ==
+  # Agents are reconciled to match this config exactly: declared agents are created/updated,
+  # undeclared agents are archived. Agents need a runtime (from sandboxes or multica daemon).
+  # If no runtime exists, agents/squads are skipped (reconciler logs notice, rebuild succeeds).
+  agents = {
+    reviewer = {
+      description = "Code reviewer for pull requests";
+      instructions = "Be thorough and terse in feedback.";  # optional; system prompt
+      runtime = "sandbox-1";              # optional; runtime name/id; null = sole runtime auto-used
+      model = "claude-opus-5";            # optional; model id (null = runtime default)
+      # thinkingLevel = "high";           # optional; reasoning effort (runtime-specific)
+      # visibility = "private";           # optional; "private" (owner) or "workspace" (all members)
+      # maxConcurrentTasks = 5;           # optional; 1-50; null = server default
+      skills = [ "pr-review" "linting-rules" ];  # optional; skill names to assign
+      # customArgs = [ "--flag" "value" ];  # optional; extra CLI args for runtime
+      # runtimeConfig = { };              # optional; runtime-specific config (JSON)
+      # customEnvFile = "/absolute/path/to/env.json";    # optional; secret env vars
+      # mcpConfigFile = "/absolute/path/to/mcp.json";    # optional; MCP server config
+    };
+
+    builder = {
+      description = "Builds and deploys code";
+      # ... (same options as above)
+    };
+  };
+
+  # == DECLARATIVE SQUADS ==
+  # Squads are reconciled to match this config exactly: declared squads are created/updated,
+  # undeclared squads are archived. Members are replaced to match. Leader is auto-added
+  # as a member — do not list it under `members`. Archived squads cannot be restored via CLI.
+  squads = {
+    delivery-team = {
+      description = "Ships the roadmap";
+      leader = "reviewer";                # required; agent name/id (auto-added as member)
+      # instructions = "";                # optional; squad-wide instructions
+      members = {
+        builder.role = "member";          # keyed by agent name, role is optional (default: "member")
+        # other-agent.role = "specialist";
+      };
+    };
+  };
+
+  # == DECLARATIVE SANDBOXES ==
+  # Sandboxes are isolated OCI containers running a multica daemon. Each auto-registers
+  # as a runtime with the backend. Agents reference sandboxes by attribute name via `runtime`.
+  # In devMode, sandboxes auto-authenticate. Reconciliation order: skills → agents → squads,
+  # then sandboxes are spun up (they auto-register after backend is healthy).
+  sandboxExtraPackages = [ ];              # optional; extra packages in all sandboxes
+  # sandboxExtraPackages = [ pkgs.ripgrep pkgs.gh ];
+
+  sandboxes = {
+    sandbox-1 = {
+      extraPackages = [ ];                # optional; extra packages for this sandbox only
+      volumeMounts = [                    # optional; docker-style bind mounts
+        # "/host/path:/container/path"
+        # "/host/path:/container/path:ro"
+      ];
+    };
+  };
+
+  # == DECLARATIVE QUICK ACTIONS ==
+  # Quick actions are named prompts that dispatch to an agent or squad. Reconciled after
+  # agents/squads. Workspace is fully owned by this config: declared actions are
+  # created/updated, undeclared actions are deleted. No CLI; reconciler drives REST API.
+  quickActions = {
+    triage = {
+      description = "Triage a GitHub issue";
+      prompt = "Analyze this issue: assign labels, estimate effort, suggest next steps.";  # required
+      assignee = "reviewer";              # required; agent or squad name/id
+      # assigneeType = "agent";           # optional; default: "agent" or "squad"
+      # visibility = "private";           # optional; "private" (you) or "public" (members)
+    };
+  };
+
+  # == DECLARATIVE AUTOPILOTS ==
+  # Autopilots are scheduled/triggered agent automations. Reconciled after agents/squads.
+  # Attribute name is the autopilot's title (its identity). Workspace is fully owned:
+  # declared autopilots are created/updated, undeclared are deleted. Only schedule (cron)
+  # triggers are declarative; webhook triggers are manual (`multica autopilot trigger-add`).
+  # Cron triggers are upserted by label; triggers not declared are deleted.
+  autopilots = {
+    "Nightly Triage" = {
+      description = "Summarize and label new issues daily.";  # required; used as run prompt
+      agent = "reviewer";                 # required; agent name/id
+      mode = "run_only";                  # optional; "run_only" (default) or "create_issue"
+      # project = "proj_123";             # optional; project id for runs/issues
+      # issueTitleTemplate = "Triage {{date}}";  # optional; template for created issues (mode: create_issue)
+      # subscribers = [ "alice@example.com" ];   # optional; members to notify
+      # status = "active";                # optional; "active" or "paused" (null = server default)
+      triggers = {
+        nightly = {
+          cron = "0 9 * * *";             # required; cron expression
+          timezone = "UTC";               # optional; default: IANA timezone
+          # enabled = true;               # optional; default: enable trigger
+        };
+        # morning-us-east = {
+        #   cron = "0 8 * * MON-FRI";
+        #   timezone = "America/New_York";
+        # };
+      };
+    };
+  };
 };
 ```
 
-Keep secrets in `environmentFile` (or sops-nix / agenix), never in the Nix config — the store
-is world-readable.
+### Key behaviors
 
-## Declarative skills
+**Full workspace ownership.** Skills, agents, squads, quick actions, and autopilots are all
+fully owned by this config: declared resources are created/updated, and *undeclared* resources
+are deleted/archived on the next rebuild. If you have resources in the UI or CLI that you want
+to keep, add them to the config first.
 
-Declare skills as an attribute set keyed by name — the attribute name *is* the skill's
-identity. On rebuild the `multica-reconcile` service reconciles them into the workspace with
-**full ownership**: declared skills are created or updated; any skill *not* declared here is
-**deleted** from the workspace. The workspace is treated as exclusively managed by this config.
+**Reconciliation order.** Resources reconcile in this order: skills → agents → squads
+(so agents can reference your declared skills, squads can reference your declared agents).
+Sandboxes spin up after the backend is healthy; if no runtime exists, agents and squads are
+skipped (reconciler logs a notice; rebuild does not fail).
 
-> **⚠️ Breaking change from the previous additive behaviour.** Any skill (or agent, squad,
-> quick action, or autopilot) that exists in the workspace but is not declared in this config
-> will be deleted on the next rebuild. If you have resources created in the UI or CLI that
-> you want to keep, add them to the config first.
+**Secrets.** Keep secrets out of the Nix store (world-readable). Use `environmentFile` for
+`JWT_SECRET`, `MULTICA_TOKEN`, and other sensitive vars. Agent `customEnvFile` and `mcpConfigFile`
+are paths read at reconcile time, not Nix values — use absolute paths like `/var/lib/multica/agent.env.json`.
 
-```nix
-services.multica.skills = {
-pr-review = {
-description = "How we review pull requests";
-text = ''
-      # PR review
-      Check tests, scope, and a rollback plan before approving.
-    '';
-# optional: settings = { model = "opus"; };  # -> the CLI's --config JSON
-# optional extra files bundled with the skill:
-# files."reference.md".source = ./skills/pr-review-reference.md;
-};
+## Authentication & Tokens
 
-lender-list.source = ./skills/lender-list.md;  # body straight from a file
-};
-```
+### Dev mode (default)
 
-Each skill takes `description`, a body as either inline `text` **or** a file `source` (exactly
-one), an optional `settings` attrset (serialised to JSON), and optional `files` (extra files
-keyed by their path within the skill, each also `text` or `source`).
+In `devMode = true`, the reconciler automatically logs in using `devLoginEmail` and `devVerificationCode`,
+creating a workspace if none exists. Log in to the desktop app with the same email to see
+the workspace and resources the reconciler manages.
 
-**Auth.** The reconciler drives the `multica` CLI, which needs a token — and on this dev build it
-gets one **automatically**, so declaring a skill and rebuilding just works:
+### Production mode
 
-- In `devMode` (the default) the reconciler logs in with the fixed code as `devLoginEmail`
-(default `admin@multica.local`), creates a workspace if none exists, and pushes your skills.
-**Log in to the desktop app with that same email** to see the workspace and skills it manages.
-- To target a real (non-dev) backend, set `devMode = false` and provide a personal access token
-(**Settings → Tokens**, a `mul_…` token) in `environmentFile` as `MULTICA_TOKEN=mul_…`. A
-supplied `MULTICA_TOKEN` always takes precedence over dev login. Without a token and outside
-dev mode the reconciler logs a notice and skips — it never fails the rebuild.
+Set `devMode = false` and supply a personal access token in `environmentFile` as `MULTICA_TOKEN=mul_…`.
+Without a token and outside dev mode, the reconciler logs a notice and skips reconciliation (does not fail the rebuild).
 
-If the identity can see more than one workspace, set `services.multica.workspaceId`.
-
-## Declarative agents and squads
-
-Agents and squads reconcile the same way, in order **skills → agents → squads** (so an agent
-can reference skills you declare, and a squad can reference agents you declare). The workspace
-is **fully owned** by this config: declared resources are created or updated; agents and squads
-not declared are **archived** on the next rebuild. An agent's assigned skills and a squad's
-members are **replaced to match** the declared set. Archived agents are restored (not duplicated)
-if re-declared. Archived squads have no CLI restore; re-declaring an archived squad name creates
-a new one.
-
-```nix
-services.multica.agents.reviewer = {
-description = "Reviews pull requests";
-runtime = "Claude (myhost)";        # runtime name or id; omit if only one exists
-model = "claude-sonnet-4-6";
-instructions = ''Be thorough and terse.'';
-skills = [ "pr-review" ];           # skill names → assigned to the agent
-};
-
-services.multica.squads.delivery = {
-description = "Ships the roadmap";
-leader = "reviewer";                # agent name or id (auto-added as a member)
-members.builder.role = "member";    # keyed by agent name; leader excluded
-};
-```
-
-**Runtimes.** An agent must run on a runtime. Runtimes can now be made **declarative** via the
-`sandboxes` option (see below), which spins up isolated containerized daemons that self-register.
-Alternatively, manually run `multica daemon start` elsewhere (e.g., your dev machine) to register
-it as a runtime. Reference a runtime by name/id with the `runtime` field (see `multica runtime list`);
-if the workspace has exactly one it's used automatically. **If no runtime exists, agents and
-squads are skipped** (the reconciler logs a notice and still does skills) so a rebuild succeeds
-even without any runtime available.
-
-**Secrets.** An agent's custom env vars and MCP config often carry API tokens, so they're passed
-as **file paths read at reconcile time**, kept out of the world-readable Nix store — give an
-absolute path, not a `./file`:
-
-```nix
-services.multica.agents.reviewer = {
-runtime = "Claude (myhost)";
-customEnvFile = "/var/lib/multica/reviewer.env.json";   # {"KEY":"value"}
-mcpConfigFile = "/var/lib/multica/reviewer.mcp.json";   # {"mcpServers":{…}}
-};
-```
-
-Non-secret bits (`instructions`, `model`, `runtimeConfig`, `customArgs`) are fine inline.
-
-## Declarative sandboxes
-
-Sandboxes let you run declarative, isolated agent-runtime containers. Each sandbox runs its own
-`multica daemon` in a dedicated OCI container with Claude Code installed, automatically registering
-as a runtime with the backend on startup. This provides **process isolation** (a crashing agent
-run can't touch the host or other sandboxes) and **filesystem isolation** via optional bind mounts.
-
-Declare sandboxes and add custom CLI tools:
-
-```nix
-services.multica.sandboxExtraPackages = [ pkgs.ripgrep pkgs.gh ];
-
-services.multica.sandboxes.hello = {
-extraPackages = [ pkgs.jq ];                    # just for this sandbox
-volumeMounts = [ "/srv/sandbox-storage:/app/workspace" ];
-};
-```
-
-Then agents reference them by their attribute name:
-
-```nix
-services.multica.agents.reviewer = {
-description = "Code reviewer";
-runtime = "hello";                              # matches the sandbox attribute name
-model = "claude-opus-5";
-instructions = "Be thorough and terse.";
-skills = [ "pr-review" ];
-};
-```
-
-**Packages.** The Nix-built sandbox image comes with Claude Code, the multica CLI, bash, git,
-curl, jq, and cacert. Add more with `sandboxExtraPackages` (all sandboxes) or per-sandbox
-`extraPackages`.
-
-**Storage.** Use `volumeMounts` (docker-style `"host:container"` or `"host:container:ro"` bind
-mount specs) for persistent workspace directories and other shared filesystems.
-
-**Auth.** In **dev mode** (`devMode = true`), each sandbox auto-authenticates with the backend
-using the same auto-login flow as the reconciler.
-
-## Declarative quick actions
-
-Quick actions are named prompts that dispatch to an agent or squad. They reconcile after
-agents/squads (so they can reference ones you declare). The workspace is fully owned by
-this config: declared actions are created or updated; quick actions not declared here are
-**deleted** on the next rebuild.
-
-```nix
-services.multica.quickActions.triage = {
-description = "Triage an issue";
-prompt = ''Triage this issue: label it and suggest next steps.'';
-assignee = "reviewer";        # an agent (default) or squad name/id
-# assigneeType = "squad";     # if the assignee is a squad
-# visibility = "public";      # default "private"
-};
-```
-
-`assignee` resolves by name against agents (or squads, if `assigneeType = "squad"`). If it
-doesn't exist yet (e.g. its runtime was unavailable so the agent wasn't created), the reconciler
-logs a notice and skips that action rather than failing the rebuild. `visibility = "public"`
-requires the assignee agent to be public; the default `"private"` works with any.
-
-Quick actions have no CLI, so the reconciler drives Multica's REST API directly — no extra setup
-beyond the token the reconciler already uses.
-
-## Declarative autopilots
-
-Autopilots are scheduled/triggered agent automations. They reconcile after agents/squads (so they
-can reference agents you declare) — the attribute name *is* the autopilot's title. The workspace
-is fully owned by this config: declared autopilots are created or updated; autopilots not declared
-here are **deleted** on the next rebuild.
-
-```nix
-services.multica.autopilots."Nightly triage" = {
-description = "Summarise and label new issues from the last day.";  # used as the run prompt
-agent = "reviewer";                    # assignee agent, by name or id
-mode = "create_issue";                 # or "run_only" (default)
-issueTitleTemplate = "Triage {{date}}"; # create_issue only; only {{date}} is interpolated
-# project = "…"; subscribers = [ "alice" ]; status = "active";  # all optional
-triggers.nightly = {
-cron = "0 9 * * *";
-timezone = "Australia/Sydney";       # default "UTC"
-# enabled = false;                   # default true
-};
-};
-```
-
-Like quick actions, an autopilot dispatches to an `agent`, which needs a runtime — if the agent
-doesn't exist yet the reconciler logs a notice and skips the autopilot rather than failing the
-rebuild. Only **schedule (cron) triggers** are declarative here, keyed by label and upserted on
-each reconcile; triggers not declared here are **deleted**. Webhook triggers added with
-`multica autopilot trigger-add` are not managed here.
+Sandboxes in dev mode auto-authenticate the same way. In production, they require `MULTICA_TOKEN`.
 
 ## Networking
 
