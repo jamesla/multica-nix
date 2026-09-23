@@ -70,197 +70,163 @@ and reopen it so it re-reads the config.
 
 ## Full configuration example
 
-Here is a complete `services.multica` block with every available option documented. Use this
-as a reference when building your config:
+Here is a complete, real-world `services.multica` configuration with every important option
+explicitly set. Use it as a starting point and modify values for your setup:
 
 ```nix
 services.multica = {
-  # == CORE ==
-  enable = true;                           # required: turn the service on
+  enable = true;
+  environmentFile = "/var/lib/multica/env";
 
-  # == NETWORKING ==
-  host = "localhost";                      # optional; default: public host for clients
-  backendPort = 8080;                      # optional; default: backend API port
-  openFirewall = false;                    # optional; default: expose backend to network?
+  host = "0.0.0.0";
+  backendPort = 8080;
+  openFirewall = true;
 
-  # == BACKEND IMAGE ==
-  backendImage = "ghcr.io/multica-ai/multica-backend@sha256:...";  # optional; override version
-  # backendImageFile = null;               # optional; pre-fetched image tarball (offline use)
+  database.createLocally = true;
 
-  # == DATABASE ==
-  database = {
-    createLocally = true;                  # optional; default: provision local PostgreSQL?
-    name = "multica";                      # optional; database name
-    user = "multica";                      # optional; database user
+  extraBackendEnvironment = {
+    RESEND_API_KEY = "re_...";
+    ALLOWED_EMAIL_DOMAINS = "example.com";
   };
 
-  # == ENVIRONMENT & SECRETS ==
-  environmentFile = "/var/lib/multica/env";  # required; env file (JWT_SECRET, MULTICA_TOKEN, etc.)
-  extraBackendEnvironment = {              # optional; extra env vars for backend container
-    # S3_BUCKET = "my-bucket";
-    # GITHUB_APP_ID = "123456";
-    # ALLOWED_EMAIL_DOMAINS = "example.com";
-  };
+  devMode = false;
+  devLoginEmail = "admin@example.com";
+  workspaceName = "Production";
+  workspaceSlug = "production";
 
-  # == DEV MODE ==
-  devMode = true;                          # optional; default: enable passwordless login
-  devVerificationCode = "888888";          # optional; fixed code for any email in dev mode
-  devLoginEmail = "admin@multica.local";   # optional; identity reconciler logs in as
-  workspaceName = "Default";               # optional; name of auto-created workspace in dev
-  workspaceSlug = "default";               # optional; slug of auto-created workspace in dev
+  installDesktop = false;
 
-  # == WORKSPACE ==
-  workspaceId = null;                      # optional; target workspace id (auto-detect if null)
-
-  # == DESKTOP CLIENT ==
-  installDesktop = true;                   # optional; default: put desktop app on PATH (Linux)
-
-  # == DECLARATIVE SKILLS ==
-  # Skills are reconciled to match this config exactly: declared skills are created/updated,
-  # undeclared skills are deleted. Reconciliation needs a token (MULTICA_TOKEN in environmentFile
-  # in production, or auto-login in devMode). Skills → agents → squads reconcile in order.
   skills = {
     pr-review = {
       description = "Code review process";
       text = ''
         # Pull Request Review
-
-        Check the following before approving:
         - Tests pass
-        - Scope is well-defined
+        - Scope is clear
         - Rollback plan exists
       '';
-      # settings = { model = "opus"; };   # optional; skill-specific config (JSON)
-      # files."reference.md".text = "...";  # optional; extra files keyed by path
-      # files."checklist.md".source = ./checklist.md;
+      settings = { model = "opus"; };
     };
 
-    linting-rules = {
-      # description = "";                 # optional; default: empty
-      source = ./skills/linting-rules.md;  # load body from file instead of inline text
+    linting = {
+      description = "Linting rules";
+      source = ./skills/linting.md;
+      files."checklist.md".source = ./checklist.md;
     };
   };
 
-  # == DECLARATIVE AGENTS ==
-  # Agents are reconciled to match this config exactly: declared agents are created/updated,
-  # undeclared agents are archived. Agents need a runtime (from sandboxes or multica daemon).
-  # If no runtime exists, agents/squads are skipped (reconciler logs notice, rebuild succeeds).
   agents = {
     reviewer = {
-      description = "Code reviewer for pull requests";
-      instructions = "Be thorough and terse in feedback.";  # optional; system prompt
-      runtime = "sandbox-1";              # optional; runtime name/id; null = sole runtime auto-used
-      model = "claude-opus-5";            # optional; model id (null = runtime default)
-      # thinkingLevel = "high";           # optional; reasoning effort (runtime-specific)
-      # visibility = "private";           # optional; "private" (owner) or "workspace" (all members)
-      # maxConcurrentTasks = 5;           # optional; 1-50; null = server default
-      skills = [ "pr-review" "linting-rules" ];  # optional; skill names to assign
-      # customArgs = [ "--flag" "value" ];  # optional; extra CLI args for runtime
-      # runtimeConfig = { };              # optional; runtime-specific config (JSON)
-      # customEnvFile = "/absolute/path/to/env.json";    # optional; secret env vars
-      # mcpConfigFile = "/absolute/path/to/mcp.json";    # optional; MCP server config
+      description = "Senior code reviewer";
+      instructions = "Be thorough but concise.";
+      runtime = "claude-sandbox";
+      model = "claude-opus-5";
+      thinkingLevel = "high";
+      visibility = "workspace";
+      maxConcurrentTasks = 3;
+      skills = [ "pr-review" "linting" ];
+      customEnvFile = "/var/lib/multica/reviewer.env.json";
+      mcpConfigFile = "/var/lib/multica/reviewer.mcp.json";
     };
 
     builder = {
-      description = "Builds and deploys code";
-      # ... (same options as above)
+      description = "CI/CD automation";
+      runtime = "claude-sandbox";
+      model = "claude-sonnet-5";
+      skills = [ "linting" ];
     };
   };
 
-  # == DECLARATIVE SQUADS ==
-  # Squads are reconciled to match this config exactly: declared squads are created/updated,
-  # undeclared squads are archived. Members are replaced to match. Leader is auto-added
-  # as a member — do not list it under `members`. Archived squads cannot be restored via CLI.
   squads = {
-    delivery-team = {
-      description = "Ships the roadmap";
-      leader = "reviewer";                # required; agent name/id (auto-added as member)
-      # instructions = "";                # optional; squad-wide instructions
+    engineering = {
+      description = "Core engineering team";
+      leader = "reviewer";
+      instructions = "Focus on quality and velocity.";
       members = {
-        builder.role = "member";          # keyed by agent name, role is optional (default: "member")
-        # other-agent.role = "specialist";
+        builder.role = "member";
       };
     };
   };
 
-  # == DECLARATIVE SANDBOXES ==
-  # Sandboxes are isolated OCI containers running a multica daemon. Each auto-registers
-  # as a runtime with the backend. Agents reference sandboxes by attribute name via `runtime`.
-  # In devMode, sandboxes auto-authenticate. Reconciliation order: skills → agents → squads,
-  # then sandboxes are spun up (they auto-register after backend is healthy).
-  sandboxExtraPackages = [ ];              # optional; extra packages in all sandboxes
-  # sandboxExtraPackages = [ pkgs.ripgrep pkgs.gh ];
+  sandboxExtraPackages = [ pkgs.ripgrep pkgs.gh ];
 
   sandboxes = {
-    sandbox-1 = {
-      extraPackages = [ ];                # optional; extra packages for this sandbox only
-      volumeMounts = [                    # optional; docker-style bind mounts
-        # "/host/path:/container/path"
-        # "/host/path:/container/path:ro"
+    claude-sandbox = {
+      extraPackages = [ pkgs.jq pkgs.yq ];
+      volumeMounts = [
+        "/var/lib/work:/app/workspace"
+        "/home/shared:/app/shared:ro"
       ];
     };
   };
 
-  # == DECLARATIVE QUICK ACTIONS ==
-  # Quick actions are named prompts that dispatch to an agent or squad. Reconciled after
-  # agents/squads. Workspace is fully owned by this config: declared actions are
-  # created/updated, undeclared actions are deleted. No CLI; reconciler drives REST API.
   quickActions = {
     triage = {
-      description = "Triage a GitHub issue";
-      prompt = "Analyze this issue: assign labels, estimate effort, suggest next steps.";  # required
-      assignee = "reviewer";              # required; agent or squad name/id
-      # assigneeType = "agent";           # optional; default: "agent" or "squad"
-      # visibility = "private";           # optional; "private" (you) or "public" (members)
+      description = "Label and prioritize issues";
+      prompt = "Triage this: assign labels, estimate effort, suggest owner.";
+      assignee = "reviewer";
+      assigneeType = "agent";
+      visibility = "public";
+    };
+
+    review-pr = {
+      description = "Review a pull request";
+      prompt = "Review this PR: check tests, scope, and rollback plan.";
+      assignee = "engineering";
+      assigneeType = "squad";
+      visibility = "workspace";
     };
   };
 
-  # == DECLARATIVE AUTOPILOTS ==
-  # Autopilots are scheduled/triggered agent automations. Reconciled after agents/squads.
-  # Attribute name is the autopilot's title (its identity). Workspace is fully owned:
-  # declared autopilots are created/updated, undeclared are deleted. Only schedule (cron)
-  # triggers are declarative; webhook triggers are manual (`multica autopilot trigger-add`).
-  # Cron triggers are upserted by label; triggers not declared are deleted.
   autopilots = {
-    "Nightly Triage" = {
-      description = "Summarize and label new issues daily.";  # required; used as run prompt
-      agent = "reviewer";                 # required; agent name/id
-      mode = "run_only";                  # optional; "run_only" (default) or "create_issue"
-      # project = "proj_123";             # optional; project id for runs/issues
-      # issueTitleTemplate = "Triage {{date}}";  # optional; template for created issues (mode: create_issue)
-      # subscribers = [ "alice@example.com" ];   # optional; members to notify
-      # status = "active";                # optional; "active" or "paused" (null = server default)
+    "Weekly Digest" = {
+      description = "Summarize completed work";
+      agent = "reviewer";
+      mode = "create_issue";
+      project = "proj_123";
+      issueTitleTemplate = "Weekly Digest {{date}}";
+      subscribers = [ "alice@example.com" "bob@example.com" ];
+      status = "active";
+      triggers = {
+        friday-eod = {
+          cron = "0 17 * * FRI";
+          timezone = "America/New_York";
+          enabled = true;
+        };
+      };
+    };
+
+    "Nightly Lint" = {
+      description = "Check code quality across repos";
+      agent = "builder";
+      mode = "run_only";
       triggers = {
         nightly = {
-          cron = "0 9 * * *";             # required; cron expression
-          timezone = "UTC";               # optional; default: IANA timezone
-          # enabled = true;               # optional; default: enable trigger
+          cron = "0 2 * * *";
+          timezone = "UTC";
         };
-        # morning-us-east = {
-        #   cron = "0 8 * * MON-FRI";
-        #   timezone = "America/New_York";
-        # };
       };
     };
   };
 };
 ```
 
-### Key behaviors
+### About options
 
-**Full workspace ownership.** Skills, agents, squads, quick actions, and autopilots are all
-fully owned by this config: declared resources are created/updated, and *undeclared* resources
-are deleted/archived on the next rebuild. If you have resources in the UI or CLI that you want
-to keep, add them to the config first.
+**Omit defaults.** Any option not shown in the example uses its module default. See the Nix
+module (`modules/multica.nix`) for the complete option reference with all defaults and descriptions.
 
-**Reconciliation order.** Resources reconcile in this order: skills → agents → squads
-(so agents can reference your declared skills, squads can reference your declared agents).
-Sandboxes spin up after the backend is healthy; if no runtime exists, agents and squads are
-skipped (reconciler logs a notice; rebuild does not fail).
+**Full workspace ownership.** Skills, agents, squads, quick actions, and autopilots declared
+here are created/updated on rebuild. Any resources *not* declared are deleted/archived. If you
+have manually created resources to keep, add them to the config first.
 
-**Secrets.** Keep secrets out of the Nix store (world-readable). Use `environmentFile` for
-`JWT_SECRET`, `MULTICA_TOKEN`, and other sensitive vars. Agent `customEnvFile` and `mcpConfigFile`
-are paths read at reconcile time, not Nix values — use absolute paths like `/var/lib/multica/agent.env.json`.
+**Reconciliation order.** Resources reconcile in sequence: skills → agents → squads (agents
+can reference declared skills; squads can reference declared agents). Sandboxes spin up after
+the backend is healthy. If no runtime exists, agents/squads are skipped but the rebuild succeeds.
+
+**Secrets.** Keep sensitive data out of the Nix store. Use `environmentFile` for `JWT_SECRET`,
+`MULTICA_TOKEN`, API keys, etc. Agent `customEnvFile` and `mcpConfigFile` are read at
+reconcile time as absolute file paths (e.g., `/var/lib/multica/agent.env.json`).
 
 ## Authentication & Tokens
 
