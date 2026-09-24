@@ -590,14 +590,17 @@ in
     database = {
       createLocally = lib.mkOption {
         type = lib.types.bool;
+        default = false;
         description = "Provision a local PostgreSQL database with pgvector for Multica.";
       };
       name = lib.mkOption {
         type = lib.types.str;
+        default = "multica";
         description = "Database name.";
       };
       user = lib.mkOption {
         type = lib.types.str;
+        default = "multica";
         description = "Database user (owns the database; loopback trust auth).";
       };
     };
