@@ -945,7 +945,6 @@ in
             environment = {
               DATABASE_URL = databaseUrl;
               PORT = toString cfg.backendPort;
-              BIND_ADDRESS = "0.0.0.0";
               APP_ENV = "development";
               MULTICA_DEV_MODE = "1";
               MULTICA_DEV_VERIFICATION_CODE = devVerificationCode;
