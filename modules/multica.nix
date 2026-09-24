@@ -891,7 +891,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable
+  config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       environment.systemPackages = [ cliPackage ]
         ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) desktopPkg;
@@ -1013,14 +1013,15 @@ in
         };
         script = "${lib.getExe reconcile} ${reconcileManifest}";
       };
-    } // lib.mkIf (cfg.sandboxes != { }) {
-    systemd.services = lib.mapAttrs'
-      (name: _sandbox:
-        lib.nameValuePair "docker-multica-sandbox-${name}" {
-          after = [ "docker-multica-backend.service" ];
-          requires = [ "docker-multica-backend.service" ];
-        }
-      )
-      cfg.sandboxes;
-  };
+    (lib.mkIf (cfg.sandboxes != { }) {
+      systemd.services = lib.mapAttrs'
+        (name: _sandbox:
+          lib.nameValuePair "docker-multica-sandbox-${name}" {
+            after = [ "docker-multica-backend.service" ];
+            requires = [ "docker-multica-backend.service" ];
+          }
+        )
+        cfg.sandboxes;
+    })
+  ]);
 }
