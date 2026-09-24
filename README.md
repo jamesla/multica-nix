@@ -38,23 +38,15 @@ services.multica = {
   # === CORE SETTINGS ===
   installDesktop = true;                           # Put desktop app on PATH (Linux only)
 
-  # === NETWORKING ===
-  host = "localhost";                              # Public host for backend URL in clients
-  backendPort = 8080;                              # Backend API listen port
+  # Postgres (local, pgvector) is always provisioned; the backend runs in dev mode
+  # on localhost:8080. These are fixed and not configurable.
 
-  # === DATABASE ===
-  database.createLocally = true;                   # Provision local PostgreSQL + pgvector
-  database.name = "multica";                       # Database name
-  database.user = "multica";                       # Database user
-
-  # === WORKSPACE / DEV LOGIN ===
+  # === DEV LOGIN ===
   devLoginEmail = "admin@multica.local";           # Identity reconciler logs in as (dev mode)
-  workspaceName = "Default";                       # Workspace name (auto-created in dev mode)
-  workspaceSlug = "default";                       # Workspace slug (auto-created in dev mode)
 
   # === DECLARATIVE SKILLS ===
   # Fully owned by config: declared skills created/updated, undeclared skills deleted on rebuild.
-  # Reconciliation needs MULTICA_TOKEN (production) or passwordless dev-mode login.
+  # Reconciliation logs in via passwordless dev-mode login.
   skills = {
     example-skill = {
       description = "Example skill";
@@ -62,10 +54,8 @@ services.multica = {
         # Skill body
         Instructions here.
       '';
-      # source = ./skills/example.md;                    # Or load from file instead of text
       # settings = { model = "opus"; };                  # Optional skill-specific config (JSON)
       # files."reference.md" = { text = "..."; };        # Optional extra files
-      # files."checklist.md" = { source = ./checklist; };
     };
   };
 
@@ -101,8 +91,9 @@ services.multica = {
   };
 
   # === DECLARATIVE SANDBOXES ===
-  # Isolated OCI containers running multica daemon. Each auto-registers as a runtime.
-  # Agents reference by name via runtime field.
+  # OCI containers running multica daemon, each auto-registering as a runtime.
+  # Agents reference by name via runtime field. Provides process/filesystem
+  # isolation; networking is shared with the host (--network=host).
   sandboxes = {
     my-sandbox = {
       extraPackages = [ ];                         # Extra packages for this sandbox

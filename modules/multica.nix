@@ -3,15 +3,26 @@
 let
   cfg = config.services.multica;
 
-  defaultBackendImage = "ghcr.io/multica-ai/multica-backend@sha256:a1c1053fc014b967ae33404eae5a6f725a4befa416e5c9fc657a4b6103f34723";
+  # Referenced by tag (not digest): a docker-loaded imageFile tarball registers
+  # under this tag, so the container must match it to run offline (tests) and to
+  # avoid a registry pull. The pinned digest lives in the pullImage calls.
+  defaultBackendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
 
   cliPackage = pkgs.callPackage ../pkgs/multica-cli.nix { };
   desktopPkg = pkgs.callPackage ../pkgs/multica-desktop.nix { };
   devVerificationCode = "888888";
 
-  backendUrl = "http://${cfg.host}:${toString cfg.backendPort}";
+  # Opinionated single-host dev defaults, intentionally not configurable.
+  host = "localhost";
+  backendPort = 8080;
+  dbName = "multica";
+  dbUser = "multica";
+  workspaceName = "Default";
+  workspaceSlug = "default";
 
-  databaseUrl = "postgres://${cfg.database.user}@127.0.0.1:5432/${cfg.database.name}?sslmode=disable";
+  backendUrl = "http://${host}:${toString backendPort}";
+
+  databaseUrl = "postgres://${dbUser}@127.0.0.1:5432/${dbName}?sslmode=disable";
 
   # Generate JWT_SECRET inside container on first run, persist via bind mount.
   # Uses #!/bin/sh for Alpine compatibility (Nix bash path doesn't exist in container).
@@ -46,29 +57,24 @@ let
         sleep 2
       done
 
-      # Bootstrap token in dev mode if not set.
-      if [ -z "''${MULTICA_TOKEN:-}" ]; then
-        if [ "''${MULTICA_DEV_MODE:-0}" = "1" ]; then
-          for _ in $(seq 1 6); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-              -d '{"email":"${cfg.devLoginEmail}"}' \
-              "''${MULTICA_SERVER_URL}/auth/send-code")
-            if [ "$status" = "200" ]; then break; fi
-            sleep 10
-          done
-          jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d '{"email":"${cfg.devLoginEmail}","code":"${devVerificationCode}"}' \
-            "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
-          if [ -z "$jwt" ]; then
-            echo "multica-sandbox: dev login failed (no token in verify-code response)." >&2
-            exit 1
-          fi
-          export MULTICA_TOKEN="$jwt"
-        else
-          echo "multica-sandbox: MULTICA_TOKEN not set and not in dev mode; daemon will not register." >&2
-          exit 1
-        fi
+      # Dev-mode login to obtain a token (this deployment only supports dev mode).
+      # send-code is rate-limited per email (~1/min); retry long enough to outlast
+      # one window in case another login just consumed the quota.
+      for _ in $(seq 1 12); do
+        status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+          -d '{"email":"${cfg.devLoginEmail}"}' \
+          "''${MULTICA_SERVER_URL}/auth/send-code")
+        if [ "$status" = "200" ]; then break; fi
+        sleep 10
+      done
+      jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+        -d '{"email":"${cfg.devLoginEmail}","code":"${devVerificationCode}"}' \
+        "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
+      if [ -z "$jwt" ]; then
+        echo "multica-sandbox: dev login failed (no token in verify-code response)." >&2
+        exit 1
       fi
+      export MULTICA_TOKEN="$jwt"
 
       exec ${lib.getExe cliPackage} daemon start --foreground \
         --device-name "$MULTICA_DAEMON_DEVICE_NAME" \
@@ -100,10 +106,7 @@ let
 
   jsonFormat = pkgs.formats.json { };
 
-  bodyPath = name: entry:
-    if entry.source != null
-    then entry.source
-    else pkgs.writeText "multica-skill-${name}" entry.text;
+  bodyPath = name: entry: pkgs.writeText "multica-skill-${name}" entry.text;
 
   textFile = name: s: pkgs.writeText name s;
 
@@ -168,7 +171,6 @@ let
     runtimeInputs = [ cliPackage pkgs.jq pkgs.curl pkgs.coreutils ];
     text = ''
       manifest="$1"
-      dev_mode=1
 
       for _ in $(seq 1 60); do
         if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
@@ -178,51 +180,43 @@ let
       done
 
       if [ -z "''${MULTICA_TOKEN:-}" ]; then
-        if [ "$dev_mode" = "1" ]; then
-          sent=0
-          for _ in $(seq 1 6); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-              -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; })} \
-              "''${MULTICA_SERVER_URL}/auth/send-code")
-            if [ "$status" = "200" ]; then sent=1; break; fi
-            sleep 10
-          done
-          if [ "$sent" != "1" ]; then
-            echo "multica-reconcile: could not request a dev login code (rate limited?); skipping." >&2
-            exit 0
-          fi
-          jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; code = devVerificationCode; })} \
-            "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
-          if [ -z "$jwt" ]; then
-            echo "multica-reconcile: dev login failed (no token in verify-code response)." >&2
-            exit 1
-          fi
-          MULTICA_TOKEN="$jwt"
-          export MULTICA_TOKEN
-        else
-          echo "multica-reconcile: MULTICA_TOKEN not set — add a mul_… PAT to environmentFile to enable skill reconciliation. Skipping." >&2
+        sent=0
+        # send-code is rate-limited per email (~1/min); retry long enough to outlast
+        # one window in case another login (or a prior reconcile) just used the quota.
+        for _ in $(seq 1 12); do
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; })} \
+            "''${MULTICA_SERVER_URL}/auth/send-code")
+          if [ "$status" = "200" ]; then sent=1; break; fi
+          sleep 10
+        done
+        if [ "$sent" != "1" ]; then
+          echo "multica-reconcile: could not request a dev login code (rate limited?); skipping." >&2
           exit 0
         fi
+        jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+          -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; code = devVerificationCode; })} \
+          "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
+        if [ -z "$jwt" ]; then
+          echo "multica-reconcile: dev login failed (no token in verify-code response)." >&2
+          exit 1
+        fi
+        MULTICA_TOKEN="$jwt"
+        export MULTICA_TOKEN
       fi
 
       if [ -z "''${MULTICA_WORKSPACE_ID:-}" ]; then
         count=$(multica workspace list --output json | jq 'length')
         if [ "$count" = "0" ]; then
-          if [ "$dev_mode" = "1" ]; then
-            echo "multica-reconcile: creating workspace ${cfg.workspaceName}"
-            multica workspace create \
-              --name ${lib.escapeShellArg cfg.workspaceName} \
-              --slug ${lib.escapeShellArg cfg.workspaceSlug} \
-              --output json >/dev/null
-            count=$(multica workspace list --output json | jq 'length')
-          else
-            echo "multica-reconcile: token has no workspaces." >&2
-            exit 1
-          fi
+          echo "multica-reconcile: creating workspace ${workspaceName}"
+          multica workspace create \
+            --name ${lib.escapeShellArg workspaceName} \
+            --slug ${lib.escapeShellArg workspaceSlug} \
+            --output json >/dev/null
+          count=$(multica workspace list --output json | jq 'length')
         fi
         if [ "$count" != "1" ]; then
-          echo "multica-reconcile: token sees $count workspaces; set services.multica.workspaceId." >&2
+          echo "multica-reconcile: token sees $count workspaces (expected exactly one)." >&2
           exit 1
         fi
         MULTICA_WORKSPACE_ID=$(multica workspace list --output json | jq -r '.[0].id')
@@ -270,18 +264,16 @@ let
         runtimes=$(multica runtime list --output json)
         rt_count=$(jq 'length' <<<"$runtimes")
         if [ "$rt_count" = "0" ]; then
-          if [ "$dev_mode" = "1" ]; then
-            echo "multica-reconcile: no runtimes registered; waiting for daemon to start (dev mode)..." >&2
-            for i in $(seq 1 30); do
-              sleep 10
-              runtimes=$(multica runtime list --output json)
-              rt_count=$(jq 'length' <<<"$runtimes")
-              if [ "$rt_count" != "0" ]; then
-                echo "multica-reconcile: runtime registered after $((i * 10))s; proceeding with agents/squads." >&2
-                break
-              fi
-            done
-          fi
+          echo "multica-reconcile: no runtimes registered; waiting for daemon to start..." >&2
+          for i in $(seq 1 30); do
+            sleep 10
+            runtimes=$(multica runtime list --output json)
+            rt_count=$(jq 'length' <<<"$runtimes")
+            if [ "$rt_count" != "0" ]; then
+              echo "multica-reconcile: runtime registered after $((i * 10))s; proceeding with agents/squads." >&2
+              break
+            fi
+          done
           if [ "$rt_count" = "0" ]; then
             echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
             return 0
@@ -564,22 +556,6 @@ in
       description = "Whether to put the Multica desktop client on PATH. Linux only.";
     };
 
-    host = lib.mkOption {
-      type = lib.types.str;
-      default = "localhost";
-      description = ''
-        Public host used to reach this server (drives the backend URL seeded into
-        the desktop client). Set to the machine's hostname/IP if you access Multica
-        from another machine.
-      '';
-    };
-
-    backendPort = lib.mkOption {
-      type = lib.types.port;
-      default = 8080;
-      description = "Port the backend API listens on.";
-    };
-
     backendImageFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -588,24 +564,6 @@ in
         to load instead of pulling from the registry. Used by tests for offline operation
         (tests run in sandboxed VMs with no network access and need this to avoid pull failures).
       '';
-    };
-
-    database = {
-      createLocally = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Provision a local PostgreSQL database with pgvector for Multica.";
-      };
-      name = lib.mkOption {
-        type = lib.types.str;
-        default = "multica";
-        description = "Database name.";
-      };
-      user = lib.mkOption {
-        type = lib.types.str;
-        default = "multica";
-        description = "Database user (owns the database; loopback trust auth).";
-      };
     };
 
     environmentFile = lib.mkOption {
@@ -628,18 +586,6 @@ in
       '';
     };
 
-    workspaceName = lib.mkOption {
-      type = lib.types.str;
-      default = "Default";
-      description = "Name for the workspace auto-created in dev mode when none exists.";
-    };
-
-    workspaceSlug = lib.mkOption {
-      type = lib.types.str;
-      default = "default";
-      description = "Slug for the workspace auto-created in dev mode (lowercase, digits, hyphens).";
-    };
-
     skills = lib.mkOption {
       default = { };
       description = ''
@@ -648,8 +594,8 @@ in
         created or updated to match; skills not declared here are **deleted** from
         the workspace on the next rebuild.
 
-        Requires a personal access token (`mul_…`) in `environmentFile` as
-        `MULTICA_TOKEN`; without it, reconciliation is skipped.
+        Reconciliation authenticates via passwordless dev-mode login (see
+        `devLoginEmail`).
       '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
@@ -658,29 +604,21 @@ in
             description = "Skill description shown in Multica.";
           };
           text = lib.mkOption {
-            type = lib.types.nullOr lib.types.lines;
-            description = "Inline SKILL.md markdown body. Mutually exclusive with `source`.";
-          };
-          source = lib.mkOption {
-            type = lib.types.nullOr lib.types.path;
-            description = "File providing the SKILL.md body. Mutually exclusive with `text`.";
+            type = lib.types.lines;
+            description = "Inline SKILL.md markdown body.";
           };
           settings = lib.mkOption {
             type = jsonFormat.type;
+            default = { };
             description = "Optional skill config, serialised to JSON (the CLI's --config).";
           };
           files = lib.mkOption {
+            default = { };
             description = "Extra files bundled with the skill, keyed by their path within the skill.";
             type = lib.types.attrsOf (lib.types.submodule {
-              options = {
-                text = lib.mkOption {
-                  type = lib.types.nullOr lib.types.lines;
-                  description = "Inline file body. Mutually exclusive with `source`.";
-                };
-                source = lib.mkOption {
-                  type = lib.types.nullOr lib.types.path;
-                  description = "File providing the body. Mutually exclusive with `text`.";
-                };
+              options.text = lib.mkOption {
+                type = lib.types.lines;
+                description = "Inline file body.";
               };
             });
           };
@@ -709,10 +647,12 @@ in
           };
           instructions = lib.mkOption {
             type = lib.types.nullOr lib.types.lines;
+            default = null;
             description = "System instructions for the agent.";
           };
           runtime = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
+            default = null;
             description = ''
               Runtime to run the agent on, by display name or id (see `multica runtime
               list`). Null uses the sole runtime, and fails if there is more than one.
@@ -720,10 +660,12 @@ in
           };
           model = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
+            default = null;
             description = "Model identifier (e.g. claude-sonnet-4-6). Null = runtime default.";
           };
           skills = lib.mkOption {
             type = lib.types.listOf lib.types.str;
+            default = [ ];
             description = ''
               Skill names to assign to this agent (from `skills` or already in the
               workspace). The set is replaced to match on each reconcile.
@@ -753,6 +695,7 @@ in
           };
           instructions = lib.mkOption {
             type = lib.types.nullOr lib.types.lines;
+            default = null;
             description = "Squad instructions.";
           };
           leader = lib.mkOption {
@@ -760,6 +703,7 @@ in
             description = "Leader agent, by name or id (required).";
           };
           members = lib.mkOption {
+            default = { };
             description = "Squad members, keyed by agent name (excluding the leader).";
             type = lib.types.attrsOf (lib.types.submodule {
               options.role = lib.mkOption {
@@ -869,18 +813,22 @@ in
         reference sandboxes by name via their `runtime` field.
 
         Process and filesystem isolation is provided by container boundaries.
+        Networking is shared with the host (`--network=host`), so sandboxes are
+        not network-isolated from the host or each other.
       '';
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           extraPackages = lib.mkOption {
             type = lib.types.listOf lib.types.package;
+            default = [ ];
             description = ''
-              Additional Nix packages to install in this sandbox's image, combined with
-              the module-level `sandboxExtraPackages` (e.g., [ pkgs.gh pkgs.jq ]).
+              Additional Nix packages to install in this sandbox's image
+              (e.g., [ pkgs.gh pkgs.jq ]).
             '';
           };
           volumeMounts = lib.mkOption {
             type = lib.types.listOf lib.types.str;
+            default = [ ];
             description = ''
               Docker-style bind mounts ("host:container" or "host:container:ro"), passed
               to the oci-container's volumes list for persistent workspace storage.
@@ -896,22 +844,22 @@ in
       environment.systemPackages = [ cliPackage ]
         ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) desktopPkg;
 
-      services.postgresql = lib.mkIf cfg.database.createLocally {
+      services.postgresql = {
         enable = true;
         package = pkgs.postgresql_17;
         extensions = ps: [ ps.pgvector ];
-        ensureDatabases = [ cfg.database.name ];
+        ensureDatabases = [ dbName ];
         ensureUsers = [{
-          name = cfg.database.user;
+          name = dbUser;
           ensureDBOwnership = true;
         }];
         authentication = lib.mkAfter ''
-          host ${cfg.database.name} ${cfg.database.user} 127.0.0.1/32 trust
-          host ${cfg.database.name} ${cfg.database.user} ::1/128      trust
+          host ${dbName} ${dbUser} 127.0.0.1/32 trust
+          host ${dbName} ${dbUser} ::1/128      trust
         '';
       };
 
-      systemd.services.multica-db-init = lib.mkIf cfg.database.createLocally {
+      systemd.services.multica-db-init = {
         description = "Create pgvector extension for Multica";
         after = [ "postgresql.service" "postgresql-setup.service" ];
         requires = [ "postgresql.service" ];
@@ -922,7 +870,7 @@ in
           RemainAfterExit = true;
         };
         script = ''
-          ${config.services.postgresql.package}/bin/psql -d ${cfg.database.name} \
+          ${config.services.postgresql.package}/bin/psql -d ${dbName} \
             -tAc "CREATE EXTENSION IF NOT EXISTS vector;"
         '';
       };
@@ -944,9 +892,11 @@ in
             entrypoint = "/entrypoint-wrapper.sh";
             environment = {
               DATABASE_URL = databaseUrl;
-              PORT = toString cfg.backendPort;
+              PORT = toString backendPort;
               APP_ENV = "development";
               MULTICA_DEV_MODE = "1";
+              # Pin the dev login code; the backend otherwise generates a random one
+              # per run, which would break the reconciler's passwordless dev login.
               MULTICA_DEV_VERIFICATION_CODE = devVerificationCode;
             };
             environmentFiles = [ cfg.environmentFile ];
@@ -965,7 +915,6 @@ in
               entrypoint = "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint";
               environment = {
                 MULTICA_SERVER_URL = backendUrl;
-                MULTICA_DEV_MODE = "1";
                 MULTICA_DAEMON_DEVICE_NAME = name;
                 MULTICA_AGENT_RUNTIME_NAME = name;
               };
@@ -979,22 +928,6 @@ in
         after = [ "postgresql.service" "multica-db-init.service" ];
         requires = [ "postgresql.service" "multica-db-init.service" ];
       };
-
-      assertions =
-        lib.mapAttrsToList
-          (name: skill: {
-            assertion = (skill.text == null) != (skill.source == null);
-            message = "services.multica.skills.${name}: set exactly one of `text` or `source`.";
-          })
-          cfg.skills
-        ++ lib.concatLists (lib.mapAttrsToList
-          (name: skill: lib.mapAttrsToList
-            (path: file: {
-              assertion = (file.text == null) != (file.source == null);
-              message = ''services.multica.skills.${name}.files."${path}": set exactly one of `text` or `source`.'';
-            })
-            skill.files)
-          cfg.skills);
 
       systemd.services.multica-reconcile = {
         description = "Reconcile declarative Multica resources (prunes undeclared ones)";

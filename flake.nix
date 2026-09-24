@@ -38,7 +38,7 @@
       checks = forLinux ({ pkgs, system, ... }: {
         multica-cli = self.packages.${system}.multica-cli;
         integration = import ./tests/integration.nix { inherit pkgs self; };
-        prune = import ./tests/prune.nix { inherit pkgs self; };
+        reconcile = import ./tests/reconcile.nix { inherit pkgs self; };
       });
 
       devShells = forAllSystems ({ pkgs, ... }: {

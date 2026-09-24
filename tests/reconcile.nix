@@ -4,11 +4,10 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${system};
 
-  fakeHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
   imageSha = {
     backend = {
       aarch64-linux = "sha256-TvvNtb8ZVQ8dXcyzocippiBHJmyzrSUVu2vd7ViaVQE=";
-      x86_64-linux = fakeHash;
+      x86_64-linux = "sha256-I4VpZcF5Zzzpb4zs0y7eimVQ62Zy+Jaqx8sxiyli81s=";
     };
   };
 
@@ -23,7 +22,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "multica-prune";
+  name = "multica-reconcile";
 
   nodes.machine = { ... }: {
     imports = [ self.nixosModules.multica ];
@@ -42,15 +41,8 @@ pkgs.testers.runNixOSTest {
       enable = true;
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
-      host = "localhost";
-      backendPort = 8080;
       installDesktop = false;
-      database.createLocally = true;
-      database.name = "multica";
-      database.user = "multica";
       devLoginEmail = "admin@multica.local";
-      workspaceName = "Test";
-      workspaceSlug = "test";
       skills.pr-review = {
         description = "How we review PRs";
         text = ''
@@ -87,6 +79,18 @@ pkgs.testers.runNixOSTest {
       )
       machine.succeed("journalctl -u multica-reconcile.service | grep -q 'reconcile complete'")
 
+      # Request a fresh dev login code before verifying (the reconciler consumed
+      # the previous one); the code is pinned to 888888 via MULTICA_DEV_VERIFICATION_CODE.
+      # send-code is rate-limited per email and the reconciler just used it, so
+      # retry until the window clears.
+      machine.succeed(
+          "for _ in $(seq 1 12); do "
+          "code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "
+          "-H 'Content-Type: application/json' "
+          "-d '{\"email\":\"admin@multica.local\"}' "
+          "http://127.0.0.1:8080/auth/send-code); "
+          "[ \"$code\" = 200 ] && exit 0; sleep 10; done; exit 1"
+      )
       token_json = machine.succeed(
           "curl -fsS -X POST -H 'Content-Type: application/json' "
           "-d '{\"email\":\"admin@multica.local\",\"code\":\"888888\"}' "
@@ -119,7 +123,7 @@ pkgs.testers.runNixOSTest {
       machine.wait_until_succeeds(
           f"journalctl -u multica-reconcile.service --after-cursor='{cursor}' "
           "| grep -q 'reconcile complete'",
-          timeout=120
+          timeout=240
       )
 
       machine.succeed(

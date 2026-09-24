@@ -4,11 +4,10 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${system};
 
-  fakeHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
   imageSha = {
     backend = {
       aarch64-linux = "sha256-TvvNtb8ZVQ8dXcyzocippiBHJmyzrSUVu2vd7ViaVQE=";
-      x86_64-linux = fakeHash;
+      x86_64-linux = "sha256-I4VpZcF5Zzzpb4zs0y7eimVQ62Zy+Jaqx8sxiyli81s=";
     };
   };
 
@@ -43,19 +42,10 @@ pkgs.testers.runNixOSTest {
 
       installDesktop = false;
 
-      host = "localhost";
-      backendPort = 8080;
-
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
 
-      database.createLocally = true;
-      database.name = "multica";
-      database.user = "multica";
-
       devLoginEmail = "admin@multica.local";
-      workspaceName = "Test";
-      workspaceSlug = "test";
 
       skills.pr-review = {
         description = "How we review PRs";
@@ -68,8 +58,6 @@ pkgs.testers.runNixOSTest {
       agents.reviewer = {
         description = "Reviews PRs";
         instructions = "Be terse.";
-        runtime = null;
-        model = null;
         skills = [ "pr-review" ];
       };
 
@@ -112,7 +100,9 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("docker-multica-backend.service")
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/health", timeout=180)
 
-    machine.succeed("multica --version | grep -q 0.4.41")
+    # Avoid `grep -q`, which closes the pipe on first match and can SIGPIPE
+    # `multica` (exit 141 under pipefail); grep without -q consumes all output.
+    machine.succeed("multica --version | grep 0.4.41")
 
     machine.succeed(
         "curl -fsS -X POST -H 'Content-Type: application/json' "
@@ -146,7 +136,7 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed(
         "journalctl -u multica-reconcile.service "
-        "| grep -q \"quick action triage assignee agent 'reviewer' not found\""
+        "| grep -q \"quick action triage assignee 'reviewer' not found\""
     )
     machine.succeed(
         "sudo -u postgres psql -d multica -tAc "
