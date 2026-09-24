@@ -74,8 +74,6 @@ pkgs.testers.runNixOSTest {
       machine.start()
 
       machine.wait_for_unit("multi-user.target", timeout=120)
-      machine.succeed("systemctl status postgresql.service || journalctl -u postgresql.service -n 50")
-
       machine.wait_for_unit("postgresql.service", timeout=120)
       machine.wait_for_unit("multica-db-init.service")
       machine.wait_for_unit("docker-multica-backend.service")
