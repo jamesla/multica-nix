@@ -1013,7 +1013,7 @@ in
         };
         script = "${lib.getExe reconcile} ${reconcileManifest}";
       };
-    },
+    }
     (lib.mkIf (cfg.sandboxes != { }) {
       systemd.services = lib.mapAttrs'
         (name: _sandbox:
