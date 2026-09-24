@@ -29,9 +29,9 @@ pkgs.testers.runNixOSTest {
     imports = [ self.nixosModules.multica ];
 
     virtualisation = {
-      memorySize = 4096;
-      diskSize = 8192;
-      cores = 2;
+      memorySize = 8192;
+      diskSize = 16384;
+      cores = 4;
     };
 
     environment.etc."multica/secret.env".text = ''
@@ -44,6 +44,7 @@ pkgs.testers.runNixOSTest {
       backendImageFile = backendImage;
       host = "localhost";
       backendPort = 8080;
+      installDesktop = false;
       database.createLocally = true;
       database.name = "multica";
       database.user = "multica";
@@ -72,7 +73,10 @@ pkgs.testers.runNixOSTest {
     ''
       machine.start()
 
-      machine.wait_for_unit("postgresql.service")
+      machine.wait_for_unit("multi-user.target", timeout=120)
+      machine.succeed("systemctl status postgresql.service || journalctl -u postgresql.service -n 50")
+
+      machine.wait_for_unit("postgresql.service", timeout=120)
       machine.wait_for_unit("multica-db-init.service")
       machine.wait_for_unit("docker-multica-backend.service")
       machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/health", timeout=180)
