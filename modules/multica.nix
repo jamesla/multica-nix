@@ -106,19 +106,15 @@ let
 
   jsonFormat = pkgs.formats.json { };
 
-  bodyPath = name: entry: pkgs.writeText "multica-skill-${name}" entry.text;
-
-  textFile = name: s: pkgs.writeText name s;
-
   reconcileManifest = jsonFormat.generate "multica-reconcile.json" {
     skills = lib.mapAttrsToList
       (name: skill: {
         inherit name;
         inherit (skill) description;
         config = skill.settings;
-        body = bodyPath name skill;
+        body = skill.text;
         files = lib.mapAttrsToList
-          (path: file: { inherit path; content = bodyPath "${name}-file" file; })
+          (path: file: { inherit path; content = file.text; })
           skill.files;
       })
       cfg.skills;
@@ -126,22 +122,14 @@ let
     agents = lib.mapAttrsToList
       (name: agent: {
         inherit name;
-        inherit (agent) description runtime model skills;
-        instructions =
-          if agent.instructions != null
-          then textFile "multica-agent-${name}-instructions" agent.instructions
-          else null;
+        inherit (agent) description runtime model skills instructions;
       })
       cfg.agents;
 
     squads = lib.mapAttrsToList
       (name: squad: {
         inherit name;
-        inherit (squad) description leader;
-        instructions =
-          if squad.instructions != null
-          then textFile "multica-squad-${name}-instructions" squad.instructions
-          else null;
+        inherit (squad) description leader instructions;
         members = lib.mapAttrsToList
           (agentName: m: { agent = agentName; inherit (m) role; })
           squad.members;
@@ -231,7 +219,9 @@ let
         body=$(jq -r '.body' <<<"$skill")
         config=$(jq -c '.config' <<<"$skill")
 
-        args=(--description "$description" --content-file "$body")
+        body_tmp=$(mktemp)
+        printf '%s' "$body" > "$body_tmp"
+        args=(--description "$description" --content-file "$body_tmp")
         if [ "$config" != "{}" ] && [ "$config" != "null" ]; then
           args+=(--config "$config")
         fi
@@ -245,12 +235,16 @@ let
           echo "multica-reconcile: creating $name"
           id=$(multica skill create --name "$name" "''${args[@]}" --output json | jq -r '.id')
         fi
+        rm -f "$body_tmp"
 
         jq -c '.files[]' <<<"$skill" | while read -r file; do
           path=$(jq -r '.path' <<<"$file")
           content=$(jq -r '.content' <<<"$file")
+          content_tmp=$(mktemp)
+          printf '%s' "$content" > "$content_tmp"
           echo "multica-reconcile: upserting file $name/$path"
-          multica skill files upsert "$id" --path "$path" --content-file "$content" >/dev/null
+          multica skill files upsert "$id" --path "$path" --content-file "$content_tmp" >/dev/null
+          rm -f "$content_tmp"
         done
       done
 
@@ -302,7 +296,7 @@ let
 
           args=()
           v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
-          v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$(cat "$v")")
+          v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$v")
           v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
 
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
@@ -346,14 +340,14 @@ let
             echo "multica-reconcile: updating squad $name ($sid)"
             uargs=(--leader "$leader_id")
             [ -n "$description" ] && uargs+=(--description "$description")
-            [ -n "$instr" ] && uargs+=(--instructions "$(cat "$instr")")
+            [ -n "$instr" ] && uargs+=(--instructions "$instr")
             multica squad update "$sid" "''${uargs[@]}" >/dev/null
           else
             echo "multica-reconcile: creating squad $name"
             cargs=(--name "$name" --leader "$leader_id")
             [ -n "$description" ] && cargs+=(--description "$description")
             sid=$(multica squad create "''${cargs[@]}" --output json | jq -r '.id')
-            [ -n "$instr" ] && multica squad update "$sid" --instructions "$(cat "$instr")" >/dev/null
+            [ -n "$instr" ] && multica squad update "$sid" --instructions "$instr" >/dev/null
           fi
 
           current=$(multica squad member list "$sid" --output json)
