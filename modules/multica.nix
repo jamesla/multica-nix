@@ -560,11 +560,13 @@ in
 
     installDesktop = lib.mkOption {
       type = lib.types.bool;
+      default = false;
       description = "Whether to put the Multica desktop client on PATH. Linux only.";
     };
 
     host = lib.mkOption {
       type = lib.types.str;
+      default = "localhost";
       description = ''
         Public host used to reach this server (drives the backend URL seeded into
         the desktop client). Set to the machine's hostname/IP if you access Multica
@@ -574,6 +576,7 @@ in
 
     backendPort = lib.mkOption {
       type = lib.types.port;
+      default = 8080;
       description = "Port the backend API listens on.";
     };
 
@@ -607,6 +610,7 @@ in
 
     environmentFile = lib.mkOption {
       type = lib.types.path;
+      default = "/var/lib/multica/env";
       description = ''
         Path to an env file (KEY=VALUE lines) read at runtime, kept OUT of the Nix
         store. JWT_SECRET is auto-generated inside the backend container.
@@ -616,6 +620,7 @@ in
 
     devLoginEmail = lib.mkOption {
       type = lib.types.str;
+      default = "admin@multica.local";
       description = ''
         Identity the skills reconciler logs in as (via `devMode` login) to obtain a
         token when `MULTICA_TOKEN` is unset. Log in to the desktop app with this
@@ -625,15 +630,18 @@ in
 
     workspaceName = lib.mkOption {
       type = lib.types.str;
-      description = "Name for the workspace auto-created in `devMode` when none exists.";
+      default = "Default";
+      description = "Name for the workspace auto-created in dev mode when none exists.";
     };
 
     workspaceSlug = lib.mkOption {
       type = lib.types.str;
+      default = "default";
       description = "Slug for the workspace auto-created in dev mode (lowercase, digits, hyphens).";
     };
 
     skills = lib.mkOption {
+      default = { };
       description = ''
         Declarative Multica skills. The attribute name is the skill's name (its
         identity). The workspace is fully owned by this config: declared skills are
@@ -681,6 +689,7 @@ in
     };
 
     agents = lib.mkOption {
+      default = { };
       description = ''
         Declarative Multica agents, reconciled into the workspace on rebuild (after
         skills). The attribute name is the agent's name. The workspace is fully owned
@@ -725,6 +734,7 @@ in
     };
 
     squads = lib.mkOption {
+      default = { };
       description = ''
         Declarative Multica squads, reconciled after agents. The attribute name is the
         squad's name. The workspace is fully owned by this config: declared squads are
@@ -763,6 +773,7 @@ in
     };
 
     quickActions = lib.mkOption {
+      default = { };
       description = ''
         Declarative Multica quick actions — named prompts that dispatch to an agent or
         squad. Reconciled after agents/squads (so they can reference ones you declare).
@@ -790,6 +801,7 @@ in
     };
 
     autopilots = lib.mkOption {
+      default = { };
       description = ''
         Declarative Multica autopilots — scheduled/triggered agent automations.
         Reconciled after agents/squads (so they can reference agents you declare).
