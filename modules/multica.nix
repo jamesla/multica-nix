@@ -3,11 +3,26 @@
 let
   cfg = config.services.multica;
 
-  defaultBackendImage = "ghcr.io/multica-ai/multica-backend@sha256:a1c1053fc014b967ae33404eae5a6f725a4befa416e5c9fc657a4b6103f34723";
+  # Referenced by tag (not digest): a docker-loaded imageFile tarball registers
+  # under this tag, so the container must match it to run offline (tests) and to
+  # avoid a registry pull. The pinned digest lives in the pullImage calls.
+  defaultBackendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
 
-  backendUrl = "http://${cfg.host}:${toString cfg.backendPort}";
+  cliPackage = pkgs.callPackage ../pkgs/multica-cli.nix { };
+  desktopPkg = pkgs.callPackage ../pkgs/multica-desktop.nix { };
+  devVerificationCode = "888888";
 
-  databaseUrl = "postgres://${cfg.database.user}@127.0.0.1:5432/${cfg.database.name}?sslmode=disable";
+  # Opinionated single-host dev defaults, intentionally not configurable.
+  host = "localhost";
+  backendPort = 8080;
+  dbName = "multica";
+  dbUser = "multica";
+  workspaceName = "Default";
+  workspaceSlug = "default";
+
+  backendUrl = "http://${host}:${toString backendPort}";
+
+  databaseUrl = "postgres://${dbUser}@127.0.0.1:5432/${dbName}?sslmode=disable";
 
   # Generate JWT_SECRET inside container on first run, persist via bind mount.
   # Uses #!/bin/sh for Alpine compatibility (Nix bash path doesn't exist in container).
@@ -27,12 +42,71 @@ let
     '';
   };
 
+  sandboxEntrypoint = pkgs.writeTextFile {
+    name = "multica-sandbox-entrypoint";
+    executable = true;
+    text = ''
+      #!/bin/sh
+      set -eu
+
+      # Wait for backend health.
+      for _ in $(seq 1 60); do
+        if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+      done
+
+      # Dev-mode login to obtain a token (this deployment only supports dev mode).
+      # send-code is rate-limited per email (~1/min); retry long enough to outlast
+      # one window in case another login just consumed the quota.
+      for _ in $(seq 1 12); do
+        status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+          -d '{"email":"${cfg.devLoginEmail}"}' \
+          "''${MULTICA_SERVER_URL}/auth/send-code")
+        if [ "$status" = "200" ]; then break; fi
+        sleep 10
+      done
+      jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+        -d '{"email":"${cfg.devLoginEmail}","code":"${devVerificationCode}"}' \
+        "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
+      if [ -z "$jwt" ]; then
+        echo "multica-sandbox: dev login failed (no token in verify-code response)." >&2
+        exit 1
+      fi
+      export MULTICA_TOKEN="$jwt"
+
+      exec ${lib.getExe cliPackage} daemon start --foreground \
+        --device-name "$MULTICA_DAEMON_DEVICE_NAME" \
+        --runtime-name "$MULTICA_AGENT_RUNTIME_NAME"
+    '';
+  };
+
+  mkSandboxImage = name: extraPkgs: pkgs.dockerTools.buildLayeredImage {
+    name = "multica-sandbox-${name}";
+    tag = "latest";
+    contents = [
+      pkgs.bash
+      pkgs.coreutils
+      pkgs.curl
+      pkgs.jq
+      pkgs.cacert
+      pkgs.git
+      cliPackage
+      pkgs.claude-code
+    ] ++ extraPkgs;
+    extraCommands = ''
+      mkdir -p app/bin app/workspace
+    '';
+    config = {
+      Entrypoint = [ "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint" ];
+      WorkingDir = "/app/workspace";
+    };
+  };
+
   jsonFormat = pkgs.formats.json { };
 
-  bodyPath = name: entry:
-    if entry.source != null
-    then entry.source
-    else pkgs.writeText "multica-skill-${name}" entry.text;
+  bodyPath = name: entry: pkgs.writeText "multica-skill-${name}" entry.text;
 
   textFile = name: s: pkgs.writeText name s;
 
@@ -52,8 +126,7 @@ let
     agents = lib.mapAttrsToList
       (name: agent: {
         inherit name;
-        inherit (agent) description runtime model thinkingLevel visibility
-          maxConcurrentTasks skills customArgs runtimeConfig customEnvFile mcpConfigFile;
+        inherit (agent) description runtime model skills;
         instructions =
           if agent.instructions != null
           then textFile "multica-agent-${name}-instructions" agent.instructions
@@ -78,14 +151,14 @@ let
     quickActions = lib.mapAttrsToList
       (name: qa: {
         inherit name;
-        inherit (qa) description prompt assignee assigneeType visibility;
+        inherit (qa) description prompt assignee;
       })
       cfg.quickActions;
 
     autopilots = lib.mapAttrsToList
       (title: ap: {
         inherit title;
-        inherit (ap) description agent mode project issueTitleTemplate subscribers status;
+        inherit (ap) description agent mode;
         triggers = lib.mapAttrsToList
           (label: t: { inherit label; inherit (t) cron timezone enabled; })
           ap.triggers;
@@ -95,10 +168,9 @@ let
 
   reconcile = pkgs.writeShellApplication {
     name = "multica-reconcile";
-    runtimeInputs = [ cfg.package pkgs.jq pkgs.curl pkgs.coreutils ];
+    runtimeInputs = [ cliPackage pkgs.jq pkgs.curl pkgs.coreutils ];
     text = ''
       manifest="$1"
-      dev_mode=${if cfg.devMode then "1" else "0"}
 
       for _ in $(seq 1 60); do
         if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
@@ -108,51 +180,43 @@ let
       done
 
       if [ -z "''${MULTICA_TOKEN:-}" ]; then
-        if [ "$dev_mode" = "1" ]; then
-          sent=0
-          for _ in $(seq 1 6); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-              -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; })} \
-              "''${MULTICA_SERVER_URL}/auth/send-code")
-            if [ "$status" = "200" ]; then sent=1; break; fi
-            sleep 10
-          done
-          if [ "$sent" != "1" ]; then
-            echo "multica-reconcile: could not request a dev login code (rate limited?); skipping." >&2
-            exit 0
-          fi
-          jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; code = cfg.devVerificationCode; })} \
-            "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
-          if [ -z "$jwt" ]; then
-            echo "multica-reconcile: dev login failed (no token in verify-code response)." >&2
-            exit 1
-          fi
-          MULTICA_TOKEN="$jwt"
-          export MULTICA_TOKEN
-        else
-          echo "multica-reconcile: MULTICA_TOKEN not set — add a mul_… PAT to environmentFile to enable skill reconciliation. Skipping." >&2
+        sent=0
+        # send-code is rate-limited per email (~1/min); retry long enough to outlast
+        # one window in case another login (or a prior reconcile) just used the quota.
+        for _ in $(seq 1 12); do
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; })} \
+            "''${MULTICA_SERVER_URL}/auth/send-code")
+          if [ "$status" = "200" ]; then sent=1; break; fi
+          sleep 10
+        done
+        if [ "$sent" != "1" ]; then
+          echo "multica-reconcile: could not request a dev login code (rate limited?); skipping." >&2
           exit 0
         fi
+        jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+          -d ${lib.escapeShellArg (builtins.toJSON { email = cfg.devLoginEmail; code = devVerificationCode; })} \
+          "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
+        if [ -z "$jwt" ]; then
+          echo "multica-reconcile: dev login failed (no token in verify-code response)." >&2
+          exit 1
+        fi
+        MULTICA_TOKEN="$jwt"
+        export MULTICA_TOKEN
       fi
 
       if [ -z "''${MULTICA_WORKSPACE_ID:-}" ]; then
         count=$(multica workspace list --output json | jq 'length')
         if [ "$count" = "0" ]; then
-          if [ "$dev_mode" = "1" ]; then
-            echo "multica-reconcile: creating workspace ${cfg.workspaceName}"
-            multica workspace create \
-              --name ${lib.escapeShellArg cfg.workspaceName} \
-              --slug ${lib.escapeShellArg cfg.workspaceSlug} \
-              --output json >/dev/null
-            count=$(multica workspace list --output json | jq 'length')
-          else
-            echo "multica-reconcile: token has no workspaces." >&2
-            exit 1
-          fi
+          echo "multica-reconcile: creating workspace ${workspaceName}"
+          multica workspace create \
+            --name ${lib.escapeShellArg workspaceName} \
+            --slug ${lib.escapeShellArg workspaceSlug} \
+            --output json >/dev/null
+          count=$(multica workspace list --output json | jq 'length')
         fi
         if [ "$count" != "1" ]; then
-          echo "multica-reconcile: token sees $count workspaces; set services.multica.workspaceId." >&2
+          echo "multica-reconcile: token sees $count workspaces (expected exactly one)." >&2
           exit 1
         fi
         MULTICA_WORKSPACE_ID=$(multica workspace list --output json | jq -r '.[0].id')
@@ -200,18 +264,16 @@ let
         runtimes=$(multica runtime list --output json)
         rt_count=$(jq 'length' <<<"$runtimes")
         if [ "$rt_count" = "0" ]; then
-          if [ "$dev_mode" = "1" ]; then
-            echo "multica-reconcile: no runtimes registered; waiting for daemon to start (dev mode)..." >&2
-            for i in $(seq 1 30); do
-              sleep 10
-              runtimes=$(multica runtime list --output json)
-              rt_count=$(jq 'length' <<<"$runtimes")
-              if [ "$rt_count" != "0" ]; then
-                echo "multica-reconcile: runtime registered after $((i * 10))s; proceeding with agents/squads." >&2
-                break
-              fi
-            done
-          fi
+          echo "multica-reconcile: no runtimes registered; waiting for daemon to start..." >&2
+          for i in $(seq 1 30); do
+            sleep 10
+            runtimes=$(multica runtime list --output json)
+            rt_count=$(jq 'length' <<<"$runtimes")
+            if [ "$rt_count" != "0" ]; then
+              echo "multica-reconcile: runtime registered after $((i * 10))s; proceeding with agents/squads." >&2
+              break
+            fi
+          done
           if [ "$rt_count" = "0" ]; then
             echo "multica-reconcile: no runtimes registered (start a multica daemon); skipping agents and squads." >&2
             return 0
@@ -242,13 +304,6 @@ let
           v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
           v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$(cat "$v")")
           v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
-          v=$(jq -r '.thinkingLevel // empty' <<<"$agent"); [ -n "$v" ] && args+=(--thinking-level "$v")
-          v=$(jq -r '.visibility // empty' <<<"$agent");    [ -n "$v" ] && args+=(--visibility "$v")
-          v=$(jq -r '.maxConcurrentTasks // empty' <<<"$agent"); [ -n "$v" ] && args+=(--max-concurrent-tasks "$v")
-          v=$(jq -c '.customArgs' <<<"$agent");    [ "$v" != "[]" ] && [ "$v" != "null" ] && args+=(--custom-args "$v")
-          v=$(jq -c '.runtimeConfig' <<<"$agent"); [ "$v" != "{}" ] && [ "$v" != "null" ] && args+=(--runtime-config "$v")
-          v=$(jq -r '.customEnvFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--custom-env-file "$v")
-          v=$(jq -r '.mcpConfigFile // empty' <<<"$agent"); [ -n "$v" ] && args+=(--mcp-config-file "$v")
 
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
           if [ -n "$id" ]; then
@@ -348,14 +403,18 @@ let
           name=$(jq -r '.name' <<<"$qa")
           desc=$(jq -r '.description' <<<"$qa")
           prompt=$(jq -r '.prompt' <<<"$qa")
-          vis=$(jq -r '.visibility' <<<"$qa")
-          atype=$(jq -r '.assigneeType' <<<"$qa")
           assignee=$(jq -r '.assignee' <<<"$qa")
+          vis="private"
 
-          if [ "$atype" = "squad" ]; then pool="$qa_squads"; else pool="$qa_agents"; fi
-          aid=$(jq -r --arg a "$assignee" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$pool")
+          aid=$(jq -r --arg a "$assignee" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$qa_agents")
+          if [ -n "$aid" ]; then
+            atype="agent"
+          else
+            aid=$(jq -r --arg a "$assignee" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$qa_squads")
+            atype="squad"
+          fi
           if [ -z "$aid" ]; then
-            echo "multica-reconcile: quick action $name assignee $atype '$assignee' not found; skipping." >&2
+            echo "multica-reconcile: quick action $name assignee '$assignee' not found; skipping." >&2
             continue
           fi
 
@@ -392,9 +451,6 @@ let
           description=$(jq -r '.description' <<<"$ap")
           agent=$(jq -r '.agent' <<<"$ap")
           mode=$(jq -r '.mode' <<<"$ap")
-          project=$(jq -r '.project // empty' <<<"$ap")
-          tmpl=$(jq -r '.issueTitleTemplate // empty' <<<"$ap")
-          status=$(jq -r '.status // empty' <<<"$ap")
 
           aid=$(jq -r --arg a "$agent" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$ap_agents")
           if [ -z "$aid" ]; then
@@ -403,22 +459,14 @@ let
           fi
 
           args=(--description "$description" --agent "$aid" --mode "$mode")
-          [ -n "$project" ] && args+=(--project "$project")
-          [ -n "$tmpl" ] && args+=(--issue-title-template "$tmpl")
-          while read -r sub; do
-            [ -n "$sub" ] && args+=(--subscriber "$sub")
-          done < <(jq -r '.subscribers[]?' <<<"$ap")
 
           id=$(jq -r --arg t "$title" 'map(select(.title == $t)) | (.[0].id // empty)' <<<"$ap_existing")
           if [ -n "$id" ]; then
             echo "multica-reconcile: updating autopilot $title ($id)"
-            uargs=("''${args[@]}")
-            [ -n "$status" ] && uargs+=(--status "$status")
-            multica autopilot update "$id" --title "$title" "''${uargs[@]}" >/dev/null
+            multica autopilot update "$id" --title "$title" "''${args[@]}" >/dev/null
           else
             echo "multica-reconcile: creating autopilot $title"
             id=$(multica autopilot create --title "$title" "''${args[@]}" --output json | jq -r '.id')
-            [ -n "$status" ] && multica autopilot update "$id" --status "$status" >/dev/null
           fi
 
           existing_triggers=$(multica autopilot trigger-list "$id" --output json | jq '.triggers // .')
@@ -502,48 +550,10 @@ in
   options.services.multica = {
     enable = lib.mkEnableOption "the self-hosted Multica server";
 
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/multica-cli.nix { };
-      defaultText = lib.literalExpression "multica-cli";
-      description = "The Multica CLI package to put on PATH (used to administer the server).";
-    };
-
-    desktopPackage = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ../pkgs/multica-desktop.nix {
-        serverUrl = backendUrl;
-      };
-      defaultText = lib.literalExpression "multica-desktop";
-      description = "The Multica desktop client (Electron AppImage) to put on PATH. Linux only.";
-    };
-
     installDesktop = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = false;
       description = "Whether to put the Multica desktop client on PATH. Linux only.";
-    };
-
-    host = lib.mkOption {
-      type = lib.types.str;
-      default = "localhost";
-      description = ''
-        Public host used to reach this server (drives the backend URL seeded into
-        the desktop client). Set to the machine's hostname/IP if you access Multica
-        from another machine.
-      '';
-    };
-
-    backendPort = lib.mkOption {
-      type = lib.types.port;
-      default = 8080;
-      description = "Port the backend API listens on.";
-    };
-
-    backendImage = lib.mkOption {
-      type = lib.types.str;
-      default = defaultBackendImage;
-      description = "OCI image reference for the Multica backend (digest-pinned by default).";
     };
 
     backendImageFile = lib.mkOption {
@@ -551,26 +561,9 @@ in
       default = null;
       description = ''
         Optional pre-fetched backend image tarball (e.g. from `dockerTools.pullImage`)
-        to load instead of pulling from the registry. Used by the offline test.
+        to load instead of pulling from the registry. Used by tests for offline operation
+        (tests run in sandboxed VMs with no network access and need this to avoid pull failures).
       '';
-    };
-
-    database = {
-      createLocally = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Provision a local PostgreSQL database with pgvector for Multica.";
-      };
-      name = lib.mkOption {
-        type = lib.types.str;
-        default = "multica";
-        description = "Database name.";
-      };
-      user = lib.mkOption {
-        type = lib.types.str;
-        default = "multica";
-        description = "Database user (owns the database; loopback trust auth).";
-      };
     };
 
     environmentFile = lib.mkOption {
@@ -581,36 +574,6 @@ in
         store. JWT_SECRET is auto-generated inside the backend container.
         Use this file for any other secrets/integration vars (e.g. MULTICA_TOKEN).
       '';
-      example = "/var/lib/multica/env";
-    };
-
-    extraBackendEnvironment = lib.mkOption {
-      type = lib.types.attrsOf lib.types.str;
-      default = { };
-      description = "Extra environment variables for the backend container (integrations, S3, OAuth, ...).";
-    };
-
-    openFirewall = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Open the backend port in the firewall for access from other machines.";
-    };
-
-    devMode = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = ''
-        Run the backend in development mode: enables passwordless login with a
-        fixed verification code and lets the skills reconciler mint its own token
-        automatically (see `skills`). Local/dev only — never expose such a backend.
-        Set false for a production backend, where you must supply `MULTICA_TOKEN`.
-      '';
-    };
-
-    devVerificationCode = lib.mkOption {
-      type = lib.types.str;
-      default = "888888";
-      description = "Fixed login code accepted for any email while `devMode` is on.";
     };
 
     devLoginEmail = lib.mkOption {
@@ -623,28 +586,6 @@ in
       '';
     };
 
-    workspaceId = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = ''
-        Workspace to reconcile `skills` into. If null, the reconciler uses the
-        token's sole workspace (creating one in `devMode` if none exist) and fails
-        if the token can see more than one.
-      '';
-    };
-
-    workspaceName = lib.mkOption {
-      type = lib.types.str;
-      default = "Default";
-      description = "Name for the workspace auto-created in `devMode` when none exists.";
-    };
-
-    workspaceSlug = lib.mkOption {
-      type = lib.types.str;
-      default = "default";
-      description = "Slug for the workspace auto-created in `devMode` (lowercase, digits, hyphens).";
-    };
-
     skills = lib.mkOption {
       default = { };
       description = ''
@@ -653,36 +594,18 @@ in
         created or updated to match; skills not declared here are **deleted** from
         the workspace on the next rebuild.
 
-        Requires a personal access token (`mul_…`) in `environmentFile` as
-        `MULTICA_TOKEN`; without it, reconciliation is skipped.
-      '';
-      example = lib.literalExpression ''
-        {
-          pr-review = {
-            description = "How we review pull requests";
-            text = '''
-              # PR review
-              Check tests, scope, and a rollback plan before approving.
-            ''';
-          };
-        }
+        Reconciliation authenticates via passwordless dev-mode login (see
+        `devLoginEmail`).
       '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Skill description shown in Multica.";
           };
           text = lib.mkOption {
-            type = lib.types.nullOr lib.types.lines;
-            default = null;
-            description = "Inline SKILL.md markdown body. Mutually exclusive with `source`.";
-          };
-          source = lib.mkOption {
-            type = lib.types.nullOr lib.types.path;
-            default = null;
-            description = "File providing the SKILL.md body. Mutually exclusive with `text`.";
+            type = lib.types.lines;
+            description = "Inline SKILL.md markdown body.";
           };
           settings = lib.mkOption {
             type = jsonFormat.type;
@@ -693,17 +616,9 @@ in
             default = { };
             description = "Extra files bundled with the skill, keyed by their path within the skill.";
             type = lib.types.attrsOf (lib.types.submodule {
-              options = {
-                text = lib.mkOption {
-                  type = lib.types.nullOr lib.types.lines;
-                  default = null;
-                  description = "Inline file body. Mutually exclusive with `source`.";
-                };
-                source = lib.mkOption {
-                  type = lib.types.nullOr lib.types.path;
-                  default = null;
-                  description = "File providing the body. Mutually exclusive with `text`.";
-                };
+              options.text = lib.mkOption {
+                type = lib.types.lines;
+                description = "Inline file body.";
               };
             });
           };
@@ -724,22 +639,10 @@ in
         declarative). Reference one with `runtime`; if the workspace has exactly one,
         it is used automatically. With no runtimes, agents and squads are skipped.
       '';
-      example = lib.literalExpression ''
-        {
-          reviewer = {
-            description = "Reviews pull requests";
-            runtime = "Claude (myhost)";
-            model = "claude-sonnet-4-6";
-            instructions = "Be thorough and terse.";
-            skills = [ "pr-review" ];
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Agent description.";
           };
           instructions = lib.mkOption {
@@ -760,53 +663,12 @@ in
             default = null;
             description = "Model identifier (e.g. claude-sonnet-4-6). Null = runtime default.";
           };
-          thinkingLevel = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Reasoning/effort level (runtime-specific, e.g. low|medium|high).";
-          };
-          visibility = lib.mkOption {
-            type = lib.types.nullOr (lib.types.enum [ "private" "workspace" ]);
-            default = null;
-            description = "Invocation visibility: private (owner) or workspace (all members).";
-          };
-          maxConcurrentTasks = lib.mkOption {
-            type = lib.types.nullOr lib.types.ints.positive;
-            default = null;
-            description = "Maximum concurrent runs (1-50). Null = server default.";
-          };
           skills = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
             description = ''
               Skill names to assign to this agent (from `skills` or already in the
               workspace). The set is replaced to match on each reconcile.
-            '';
-          };
-          customArgs = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = "Custom CLI arguments for the agent's runtime.";
-          };
-          runtimeConfig = lib.mkOption {
-            type = jsonFormat.type;
-            default = { };
-            description = "Runtime config, serialised to JSON (the CLI's --runtime-config).";
-          };
-          customEnvFile = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Path to a JSON file of custom env vars (secret material) read at reconcile
-              time. Kept OUT of the Nix store — use an absolute path, not a `./file`.
-            '';
-          };
-          mcpConfigFile = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Path to a JSON MCP server config (often carries tokens) read at reconcile
-              time. Kept OUT of the Nix store — use an absolute path, not a `./file`.
             '';
           };
         };
@@ -825,20 +687,10 @@ in
         Note: archived squads cannot be restored via the CLI; re-declaring an archived
         squad name creates a new squad with the same name.
       '';
-      example = lib.literalExpression ''
-        {
-          delivery = {
-            description = "Ships the roadmap";
-            leader = "reviewer";
-            members.builder.role = "member";
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Squad description.";
           };
           instructions = lib.mkOption {
@@ -856,7 +708,6 @@ in
             type = lib.types.attrsOf (lib.types.submodule {
               options.role = lib.mkOption {
                 type = lib.types.str;
-                default = "member";
                 description = "Member's role in the squad.";
               };
             });
@@ -875,19 +726,10 @@ in
 
         Quick actions have no CLI, so the reconciler drives the REST API directly.
       '';
-      example = lib.literalExpression ''
-        {
-          triage = {
-            prompt = "Triage this issue: label it and suggest next steps.";
-            assignee = "reviewer";   # an agent (or squad) name
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
             type = lib.types.str;
-            default = "";
             description = "Quick action description.";
           };
           prompt = lib.mkOption {
@@ -897,19 +739,6 @@ in
           assignee = lib.mkOption {
             type = lib.types.str;
             description = "Agent or squad that runs the action, by name or id (required).";
-          };
-          assigneeType = lib.mkOption {
-            type = lib.types.enum [ "agent" "squad" ];
-            default = "agent";
-            description = "Whether `assignee` names an agent or a squad.";
-          };
-          visibility = lib.mkOption {
-            type = lib.types.enum [ "private" "public" ];
-            default = "private";
-            description = ''
-              Who can trigger it: private (you) or public (all members). A public action
-              requires its assignee agent to be public.
-            '';
           };
         };
       }));
@@ -932,17 +761,6 @@ in
         managed manually with `multica autopilot trigger-add`. Declared triggers are
         upserted by label; triggers not declared are **deleted** (full ownership).
       '';
-      example = lib.literalExpression ''
-        {
-          "Nightly triage" = {
-            description = "Summarise and label new issues from the last day.";
-            agent = "reviewer";           # an agent name or id
-            mode = "create_issue";
-            issueTitleTemplate = "Triage {{date}}";
-            triggers.nightly = { cron = "0 9 * * *"; timezone = "Australia/Sydney"; };
-          };
-        }
-      '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
           description = lib.mkOption {
@@ -955,40 +773,12 @@ in
           };
           mode = lib.mkOption {
             type = lib.types.enum [ "create_issue" "run_only" ];
-            default = "run_only";
             description = ''
               Execution mode: `run_only` just runs the agent; `create_issue` files an
-              issue for each run (see `issueTitleTemplate`).
+              issue for each run.
             '';
-          };
-          project = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Project id to associate runs/issues with. Null = none.";
-          };
-          issueTitleTemplate = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = ''
-              Title template for issues created in `create_issue` mode. Only `{{date}}`
-              (UTC, YYYY-MM-DD) is interpolated. Requires `mode = "create_issue"`.
-            '';
-          };
-          subscribers = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = ''
-              Members to notify for issues this autopilot creates, by name or user id.
-              The set is replaced to match on each reconcile.
-            '';
-          };
-          status = lib.mkOption {
-            type = lib.types.nullOr (lib.types.enum [ "active" "paused" ]);
-            default = null;
-            description = "Desired status. Null leaves the server default / current value.";
           };
           triggers = lib.mkOption {
-            default = { };
             description = ''
               Schedule (cron) triggers, keyed by label (the label is the identity).
               Upserted on each reconcile; triggers not listed here are deleted.
@@ -1001,12 +791,10 @@ in
                 };
                 timezone = lib.mkOption {
                   type = lib.types.str;
-                  default = "UTC";
                   description = "IANA timezone the cron expression is evaluated in.";
                 };
                 enabled = lib.mkOption {
                   type = lib.types.bool;
-                  default = true;
                   description = "Whether the trigger is enabled.";
                 };
               };
@@ -1015,119 +803,160 @@ in
         };
       }));
     };
+
+    sandboxes = lib.mkOption {
+      default = { };
+      description = ''
+        Declarative isolated agent-runtime sandboxes. Attribute name is the sandbox name.
+        Each sandbox runs in its own OCI container with Claude Code installed and a running
+        `multica daemon`, which auto-registers as a runtime with the backend. Agents can then
+        reference sandboxes by name via their `runtime` field.
+
+        Process and filesystem isolation is provided by container boundaries.
+        Networking is shared with the host (`--network=host`), so sandboxes are
+        not network-isolated from the host or each other.
+      '';
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          extraPackages = lib.mkOption {
+            type = lib.types.listOf lib.types.package;
+            default = [ ];
+            description = ''
+              Additional Nix packages to install in this sandbox's image
+              (e.g., [ pkgs.gh pkgs.jq ]).
+            '';
+          };
+          volumeMounts = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Docker-style bind mounts ("host:container" or "host:container:ro"), passed
+              to the oci-container's volumes list for persistent workspace storage.
+            '';
+          };
+        };
+      });
+    };
   };
 
-  config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ]
-      ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) cfg.desktopPackage;
+  config = lib.mkIf cfg.enable (lib.mkMerge [
+    {
+      environment.systemPackages = [ cliPackage ]
+        ++ lib.optional (cfg.installDesktop && pkgs.stdenv.hostPlatform.isLinux) desktopPkg;
 
-    services.postgresql = lib.mkIf cfg.database.createLocally {
-      enable = true;
-      package = pkgs.postgresql_17;
-      extensions = ps: [ ps.pgvector ];
-      ensureDatabases = [ cfg.database.name ];
-      ensureUsers = [{
-        name = cfg.database.user;
-        ensureDBOwnership = true;
-      }];
-      authentication = lib.mkAfter ''
-        host ${cfg.database.name} ${cfg.database.user} 127.0.0.1/32 trust
-        host ${cfg.database.name} ${cfg.database.user} ::1/128      trust
-      '';
-    };
-
-    systemd.services.multica-db-init = lib.mkIf cfg.database.createLocally {
-      description = "Create pgvector extension for Multica";
-      after = [ "postgresql.service" "postgresql-setup.service" ];
-      requires = [ "postgresql.service" ];
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        Type = "oneshot";
-        User = "postgres";
-        RemainAfterExit = true;
+      services.postgresql = {
+        enable = true;
+        package = pkgs.postgresql_17;
+        extensions = ps: [ ps.pgvector ];
+        ensureDatabases = [ dbName ];
+        ensureUsers = [{
+          name = dbUser;
+          ensureDBOwnership = true;
+        }];
+        authentication = lib.mkAfter ''
+          host ${dbName} ${dbUser} 127.0.0.1/32 trust
+          host ${dbName} ${dbUser} ::1/128      trust
+        '';
       };
-      script = ''
-        ${config.services.postgresql.package}/bin/psql -d ${cfg.database.name} \
-          -tAc "CREATE EXTENSION IF NOT EXISTS vector;"
-      '';
-    };
 
-    systemd.tmpfiles.rules = [
-      "d /var/lib/multica 0750 root root -"
-      "d /var/lib/multica/uploads 0750 root root -"
-      "d /var/lib/multica/secrets 0700 root root -"
-      "f /var/lib/multica/env 0644 root root -"
-    ];
+      systemd.services.multica-db-init = {
+        description = "Create pgvector extension for Multica";
+        after = [ "postgresql.service" "postgresql-setup.service" ];
+        requires = [ "postgresql.service" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          User = "postgres";
+          RemainAfterExit = true;
+        };
+        script = ''
+          ${config.services.postgresql.package}/bin/psql -d ${dbName} \
+            -tAc "CREATE EXTENSION IF NOT EXISTS vector;"
+        '';
+      };
 
-    virtualisation.oci-containers.backend = "docker";
-
-    virtualisation.oci-containers.containers.multica-backend = {
-      image = cfg.backendImage;
-      imageFile = cfg.backendImageFile;
-      entrypoint = "/entrypoint-wrapper.sh";
-      environment = {
-        DATABASE_URL = databaseUrl;
-        PORT = toString cfg.backendPort;
-      } // lib.optionalAttrs cfg.devMode {
-        APP_ENV = "development";
-        MULTICA_DEV_VERIFICATION_CODE = cfg.devVerificationCode;
-      } // cfg.extraBackendEnvironment;
-      environmentFiles = [ cfg.environmentFile ];
-      volumes = [
-        "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
-        "/var/lib/multica/secrets:/app/secrets"
-        "/var/lib/multica/uploads:/app/data/uploads"
+      systemd.tmpfiles.rules = [
+        "d /var/lib/multica 0750 root root -"
+        "d /var/lib/multica/uploads 0750 root root -"
+        "d /var/lib/multica/secrets 0700 root root -"
+        "f /var/lib/multica/env 0644 root root -"
       ];
-      extraOptions = [ "--network=host" ];
-    };
 
-    systemd.services.docker-multica-backend = {
-      after = [ "postgresql.service" "multica-db-init.service" ];
-      requires = [ "postgresql.service" "multica-db-init.service" ];
-    };
+      virtualisation.oci-containers.backend = "docker";
 
-    networking.firewall.allowedTCPPorts =
-      lib.mkIf cfg.openFirewall [ cfg.backendPort ];
+      virtualisation.oci-containers.containers =
+        {
+          multica-backend = {
+            image = defaultBackendImage;
+            imageFile = cfg.backendImageFile;
+            entrypoint = "/entrypoint-wrapper.sh";
+            environment = {
+              DATABASE_URL = databaseUrl;
+              PORT = toString backendPort;
+              APP_ENV = "development";
+              MULTICA_DEV_MODE = "1";
+              # Pin the dev login code; the backend otherwise generates a random one
+              # per run, which would break the reconciler's passwordless dev login.
+              MULTICA_DEV_VERIFICATION_CODE = devVerificationCode;
+            };
+            environmentFiles = [ cfg.environmentFile ];
+            volumes = [
+              "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
+              "/var/lib/multica/secrets:/app/secrets"
+              "/var/lib/multica/uploads:/app/data/uploads"
+            ];
+            extraOptions = [ "--network=host" ];
+          };
+        } // lib.mapAttrs'
+          (name: sandbox:
+            lib.nameValuePair "multica-sandbox-${name}" {
+              image = "multica-sandbox-${name}:latest";
+              imageFile = mkSandboxImage name sandbox.extraPackages;
+              entrypoint = "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint";
+              environment = {
+                MULTICA_SERVER_URL = backendUrl;
+                MULTICA_DAEMON_DEVICE_NAME = name;
+                MULTICA_AGENT_RUNTIME_NAME = name;
+              };
+              volumes = sandbox.volumeMounts;
+              extraOptions = [ "--network=host" ];
+            }
+          )
+          cfg.sandboxes;
 
-    assertions =
-      lib.mapAttrsToList
-        (name: skill: {
-          assertion = (skill.text == null) != (skill.source == null);
-          message = "services.multica.skills.${name}: set exactly one of `text` or `source`.";
-        })
-        cfg.skills
-      ++ lib.concatLists (lib.mapAttrsToList
-        (name: skill: lib.mapAttrsToList
-          (path: file: {
-            assertion = (file.text == null) != (file.source == null);
-            message = ''services.multica.skills.${name}.files."${path}": set exactly one of `text` or `source`.'';
-          })
-          skill.files)
-        cfg.skills)
-      ++ lib.mapAttrsToList
-        (title: ap: {
-          assertion = ap.issueTitleTemplate == null || ap.mode == "create_issue";
-          message = ''services.multica.autopilots."${title}": `issueTitleTemplate` requires `mode = "create_issue"`.'';
-        })
-        cfg.autopilots;
-
-    systemd.services.multica-reconcile = {
-      description = "Reconcile declarative Multica resources (prunes undeclared ones)";
-      after = [ "docker-multica-backend.service" ];
-      requires = [ "docker-multica-backend.service" ];
-      wantedBy = [ "multi-user.target" ];
-      restartTriggers = [ reconcileManifest ];
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        EnvironmentFile = cfg.environmentFile;
-        StateDirectory = "multica-reconcile";
-        Environment = [
-          "HOME=%S/multica-reconcile"
-          "MULTICA_SERVER_URL=${backendUrl}"
-        ] ++ lib.optional (cfg.workspaceId != null) "MULTICA_WORKSPACE_ID=${cfg.workspaceId}";
+      systemd.services.docker-multica-backend = {
+        after = [ "postgresql.service" "multica-db-init.service" ];
+        requires = [ "postgresql.service" "multica-db-init.service" ];
       };
-      script = "${lib.getExe reconcile} ${reconcileManifest}";
-    };
-  };
+
+      systemd.services.multica-reconcile = {
+        description = "Reconcile declarative Multica resources (prunes undeclared ones)";
+        after = [ "docker-multica-backend.service" ];
+        requires = [ "docker-multica-backend.service" ];
+        wantedBy = [ "multi-user.target" ];
+        restartTriggers = [ reconcileManifest ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          EnvironmentFile = cfg.environmentFile;
+          StateDirectory = "multica-reconcile";
+          Environment = [
+            "HOME=%S/multica-reconcile"
+            "MULTICA_SERVER_URL=${backendUrl}"
+          ];
+        };
+        script = "${lib.getExe reconcile} ${reconcileManifest}";
+      };
+    }
+    (lib.mkIf (cfg.sandboxes != { }) {
+      systemd.services = lib.mapAttrs'
+        (name: _sandbox:
+          lib.nameValuePair "docker-multica-sandbox-${name}" {
+            after = [ "docker-multica-backend.service" ];
+            requires = [ "docker-multica-backend.service" ];
+          }
+        )
+        cfg.sandboxes;
+    })
+  ]);
 }

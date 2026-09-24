@@ -4,11 +4,10 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   arch = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${system};
 
-  fakeHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
   imageSha = {
     backend = {
       aarch64-linux = "sha256-TvvNtb8ZVQ8dXcyzocippiBHJmyzrSUVu2vd7ViaVQE=";
-      x86_64-linux = fakeHash;
+      x86_64-linux = "sha256-I4VpZcF5Zzzpb4zs0y7eimVQ62Zy+Jaqx8sxiyli81s=";
     };
   };
 
@@ -40,9 +39,14 @@ pkgs.testers.runNixOSTest {
 
     services.multica = {
       enable = true;
+
+      installDesktop = false;
+
       environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
-      backendImage = "ghcr.io/multica-ai/multica-backend:v0.4.41";
+
+      devLoginEmail = "admin@multica.local";
+
       skills.pr-review = {
         description = "How we review PRs";
         text = ''
@@ -50,24 +54,36 @@ pkgs.testers.runNixOSTest {
           Check tests, scope, and a rollback plan.
         '';
       };
+
       agents.reviewer = {
         description = "Reviews PRs";
         instructions = "Be terse.";
         skills = [ "pr-review" ];
       };
+
       squads.delivery = {
         description = "Ships the roadmap";
         leader = "reviewer";
       };
+
       quickActions.triage = {
+        description = "Triage issues";
         prompt = "Triage this issue.";
         assignee = "reviewer";
       };
+
       autopilots.nightly = {
         description = "Summarise open issues each night.";
         agent = "reviewer";
-        triggers.nightly = { cron = "0 9 * * *"; };
+        mode = "run_only";
+        triggers.nightly = {
+          cron = "0 9 * * *";
+          timezone = "UTC";
+          enabled = true;
+        };
       };
+
+      sandboxes = { };
     };
   };
 
@@ -84,7 +100,9 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("docker-multica-backend.service")
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/health", timeout=180)
 
-    machine.succeed("multica --version | grep -q 0.4.41")
+    # Avoid `grep -q`, which closes the pipe on first match and can SIGPIPE
+    # `multica` (exit 141 under pipefail); grep without -q consumes all output.
+    machine.succeed("multica --version | grep 0.4.41")
 
     machine.succeed(
         "curl -fsS -X POST -H 'Content-Type: application/json' "
@@ -118,7 +136,7 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed(
         "journalctl -u multica-reconcile.service "
-        "| grep -q \"quick action triage assignee agent 'reviewer' not found\""
+        "| grep -q \"quick action triage assignee 'reviewer' not found\""
     )
     machine.succeed(
         "sudo -u postgres psql -d multica -tAc "
