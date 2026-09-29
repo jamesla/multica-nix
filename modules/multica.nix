@@ -95,7 +95,7 @@ let
     agents = lib.mapAttrsToList
       (name: agent: {
         inherit name;
-        inherit (agent) description runtime model skills instructions env;
+        inherit (agent) description runtime model skills instructions env thinking;
       })
       cfg.agents;
 
@@ -274,6 +274,7 @@ let
           v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
           v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$v")
           v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
+          v=$(jq -r '.thinking // empty' <<<"$agent");      [ -n "$v" ] && args+=(--thinking-level "$v")
 
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
           if [ -n "$id" ]; then
@@ -649,6 +650,15 @@ in
             type = lib.types.nullOr lib.types.str;
             default = null;
             description = "Model identifier (e.g. claude-sonnet-4-6). Null = runtime default.";
+          };
+          thinking = lib.mkOption {
+            type = lib.types.enum [ "low" "medium" "high" "xhigh" "max" ];
+            default = "low";
+            description = ''
+              Reasoning/effort level for the agent's runtime, passed as
+              `--thinking-level`. Claude-specific levels only (low|medium|high|xhigh|max);
+              other runtimes may reject this value. Defaults to the lowest level.
+            '';
           };
           skills = lib.mkOption {
             type = lib.types.listOf lib.types.str;

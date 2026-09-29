@@ -70,6 +70,7 @@ services.multica = {
       instructions = "Be thorough.";                    # System prompt
       runtime = "my-sandbox";                          # Sandbox name (or a runtime display name/id); null = sole runtime
       model = "claude-opus-5";                         # Model ID; null = runtime default
+      thinking = "low";                                # Reasoning level (low|medium|high|xhigh|max)
       skills = [ "example-skill" ];                    # Skill names to assign
     };
   };
