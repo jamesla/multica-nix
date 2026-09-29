@@ -21,8 +21,15 @@ let
   workspaceSlug = "default";
 
   backendUrl = "http://${host}:${toString backendPort}";
+  # Sandboxes run on Docker's bridge network, so they reach the backend via a host address
+  # the consumer supplies (not localhost).
+  sandboxBackendUrl = "http://${cfg.sandboxBackendHost}:${toString backendPort}";
 
   databaseUrl = "postgres://${dbUser}@127.0.0.1:5432/${dbName}?sslmode=disable";
+
+  # Host path of the persistent MULTICA_TOKEN env file (written by the backend container
+  # into its bind-mounted /app/secrets); every sandbox gets it via --env-file.
+  tokenEnvFile = "/var/lib/multica/secrets/multica.env";
 
   # Generate JWT_SECRET inside container on first run, persist via bind mount.
   # Uses #!/bin/sh for Alpine compatibility (Nix bash path doesn't exist in container).
@@ -42,46 +49,6 @@ let
     '';
   };
 
-  sandboxEntrypoint = pkgs.writeTextFile {
-    name = "multica-sandbox-entrypoint";
-    executable = true;
-    text = ''
-      #!/bin/sh
-      set -eu
-
-      # Wait for backend health.
-      for _ in $(seq 1 60); do
-        if curl -fsS "''${MULTICA_SERVER_URL}/health" >/dev/null 2>&1; then
-          break
-        fi
-        sleep 2
-      done
-
-      # Dev-mode login to obtain a token (this deployment only supports dev mode).
-      # send-code is rate-limited per email (~1/min); retry long enough to outlast
-      # one window in case another login just consumed the quota.
-      for _ in $(seq 1 12); do
-        status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-          -d '{"email":"${cfg.devLoginEmail}"}' \
-          "''${MULTICA_SERVER_URL}/auth/send-code")
-        if [ "$status" = "200" ]; then break; fi
-        sleep 10
-      done
-      jwt=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-        -d '{"email":"${cfg.devLoginEmail}","code":"${devVerificationCode}"}' \
-        "''${MULTICA_SERVER_URL}/auth/verify-code" | jq -r '.token // empty')
-      if [ -z "$jwt" ]; then
-        echo "multica-sandbox: dev login failed (no token in verify-code response)." >&2
-        exit 1
-      fi
-      export MULTICA_TOKEN="$jwt"
-
-      exec ${lib.getExe cliPackage} daemon start --foreground \
-        --device-name "$MULTICA_DAEMON_DEVICE_NAME" \
-        --runtime-name "$MULTICA_AGENT_RUNTIME_NAME"
-    '';
-  };
-
   mkSandboxImage = name: extraPkgs: pkgs.dockerTools.buildLayeredImage {
     name = "multica-sandbox-${name}";
     tag = "latest";
@@ -96,19 +63,21 @@ let
       pkgs.claude-code
     ] ++ extraPkgs;
     extraCommands = ''
-      mkdir -p app/bin app/workspace
+      mkdir -p app/workspace
+      mkdir -p tmp
+      chmod 1777 tmp
     '';
     config = {
-      Entrypoint = [ "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint" ];
+      Cmd = [
+        "sh" "-c"
+        "multica login --token \"$MULTICA_TOKEN\" && exec multica daemon start --foreground"
+      ];
       WorkingDir = "/app/workspace";
+      Env = [ "HOME=/root" ];
     };
   };
 
   jsonFormat = pkgs.formats.json { };
-
-  bodyPath = name: entry: pkgs.writeText "multica-skill-${name}" entry.text;
-
-  textFile = name: s: pkgs.writeText name s;
 
   reconcileManifest = jsonFormat.generate "multica-reconcile.json" {
     skills = lib.mapAttrsToList
@@ -116,9 +85,9 @@ let
         inherit name;
         inherit (skill) description;
         config = skill.settings;
-        body = bodyPath name skill;
+        body = skill.text;
         files = lib.mapAttrsToList
-          (path: file: { inherit path; content = bodyPath "${name}-file" file; })
+          (path: file: { inherit path; content = file.text; })
           skill.files;
       })
       cfg.skills;
@@ -126,22 +95,14 @@ let
     agents = lib.mapAttrsToList
       (name: agent: {
         inherit name;
-        inherit (agent) description runtime model skills;
-        instructions =
-          if agent.instructions != null
-          then textFile "multica-agent-${name}-instructions" agent.instructions
-          else null;
+        inherit (agent) description runtime model skills instructions env;
       })
       cfg.agents;
 
     squads = lib.mapAttrsToList
       (name: squad: {
         inherit name;
-        inherit (squad) description leader;
-        instructions =
-          if squad.instructions != null
-          then textFile "multica-squad-${name}-instructions" squad.instructions
-          else null;
+        inherit (squad) description leader instructions;
         members = lib.mapAttrsToList
           (agentName: m: { agent = agentName; inherit (m) role; })
           squad.members;
@@ -231,7 +192,9 @@ let
         body=$(jq -r '.body' <<<"$skill")
         config=$(jq -c '.config' <<<"$skill")
 
-        args=(--description "$description" --content-file "$body")
+        body_tmp=$(mktemp)
+        printf '%s' "$body" > "$body_tmp"
+        args=(--description "$description" --content-file "$body_tmp")
         if [ "$config" != "{}" ] && [ "$config" != "null" ]; then
           args+=(--config "$config")
         fi
@@ -245,12 +208,16 @@ let
           echo "multica-reconcile: creating $name"
           id=$(multica skill create --name "$name" "''${args[@]}" --output json | jq -r '.id')
         fi
+        rm -f "$body_tmp"
 
         jq -c '.files[]' <<<"$skill" | while read -r file; do
           path=$(jq -r '.path' <<<"$file")
           content=$(jq -r '.content' <<<"$file")
+          content_tmp=$(mktemp)
+          printf '%s' "$content" > "$content_tmp"
           echo "multica-reconcile: upserting file $name/$path"
-          multica skill files upsert "$id" --path "$path" --content-file "$content" >/dev/null
+          multica skill files upsert "$id" --path "$path" --content-file "$content_tmp" >/dev/null
+          rm -f "$content_tmp"
         done
       done
 
@@ -288,7 +255,10 @@ let
 
           rt=$(jq -r '.runtime // empty' <<<"$agent")
           if [ -n "$rt" ]; then
-            rtid=$(jq -r --arg r "$rt" 'map(select(.id == $r or .name == $r)) | (.[0].id // empty)' <<<"$runtimes")
+            # Sandbox runtimes match on daemon_id = sandbox-<name>.
+            # Host runtimes match on daemon_id = host-<name> or id/name fields.
+            # This allows runtime names like "hermes" to resolve to their daemon registration.
+            rtid=$(jq -r --arg r "$rt" 'map(select(.daemon_id == ("sandbox-" + $r) or .daemon_id == ("host-" + $r) or .id == $r or .name == $r)) | sort_by(.status != "online") | (.[0].id // empty)' <<<"$runtimes")
           elif [ "$rt_count" = "1" ]; then
             rtid=$(jq -r '.[0].id' <<<"$runtimes")
           else
@@ -300,9 +270,9 @@ let
             exit 1
           fi
 
-          args=()
+          args=(--visibility workspace)
           v=$(jq -r '.description' <<<"$agent");            [ -n "$v" ] && args+=(--description "$v")
-          v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$(cat "$v")")
+          v=$(jq -r '.instructions // empty' <<<"$agent");  [ -n "$v" ] && args+=(--instructions "$v")
           v=$(jq -r '.model // empty' <<<"$agent");         [ -n "$v" ] && args+=(--model "$v")
 
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$existing_agents")
@@ -325,6 +295,17 @@ let
 
           skill_ids=$(jq -r --slurpfile all <(printf '%s' "$skills_all") '[ .skills[] as $n | ($all[0][] | select(.name == $n) | .id) ] | join(",")' <<<"$agent")
           multica agent skills set "$id" --skill-ids "$skill_ids" >/dev/null
+
+          env_want=$(jq -c '.env // {}' <<<"$agent")
+          if [ "$env_want" != "{}" ]; then
+            env_current=$(multica agent env get "$id" --output json | jq -c '.custom_env // {}')
+            env_merged=$(jq -c -n --argjson cur "$env_current" --argjson want "$env_want" '$cur * $want')
+            env_tmp=$(mktemp)
+            printf '%s' "$env_merged" > "$env_tmp"
+            echo "multica-reconcile: setting custom env for agent $name ($id)"
+            multica agent env set "$id" --custom-env-file "$env_tmp" >/dev/null
+            rm -f "$env_tmp"
+          fi
         done
 
         existing_agents=$(multica agent list --output json)
@@ -346,14 +327,14 @@ let
             echo "multica-reconcile: updating squad $name ($sid)"
             uargs=(--leader "$leader_id")
             [ -n "$description" ] && uargs+=(--description "$description")
-            [ -n "$instr" ] && uargs+=(--instructions "$(cat "$instr")")
+            [ -n "$instr" ] && uargs+=(--instructions "$instr")
             multica squad update "$sid" "''${uargs[@]}" >/dev/null
           else
             echo "multica-reconcile: creating squad $name"
             cargs=(--name "$name" --leader "$leader_id")
             [ -n "$description" ] && cargs+=(--description "$description")
             sid=$(multica squad create "''${cargs[@]}" --output json | jq -r '.id')
-            [ -n "$instr" ] && multica squad update "$sid" --instructions "$(cat "$instr")" >/dev/null
+            [ -n "$instr" ] && multica squad update "$sid" --instructions "$instr" >/dev/null
           fi
 
           current=$(multica squad member list "$sid" --output json)
@@ -374,18 +355,6 @@ let
               multica squad member set-role "$sid" --member-id "$maid" --role "$mrole" --member-type agent >/dev/null
             fi
           done
-
-          keep=$(jq -r --slurpfile agents <(printf '%s' "$existing_agents") '[ .members[].agent as $a | ($agents[0][] | select(.name == $a or .id == $a) | .id) ] | join(" ")' <<<"$squad")
-          keep=" $leader_id $keep "
-          jq -r '.[] | select(.role != "leader") | .member_id' <<<"$current" | while read -r mid; do
-            case "$keep" in
-              *" $mid "*) : ;;
-              *)
-                echo "multica-reconcile: squad $name remove member $mid"
-                multica squad member remove "$sid" --member-id "$mid" --type agent >/dev/null
-                ;;
-            esac
-          done
         done
       }
       reconcile_agents_squads
@@ -404,7 +373,7 @@ let
           desc=$(jq -r '.description' <<<"$qa")
           prompt=$(jq -r '.prompt' <<<"$qa")
           assignee=$(jq -r '.assignee' <<<"$qa")
-          vis="private"
+          vis="workspace"
 
           aid=$(jq -r --arg a "$assignee" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$qa_agents")
           if [ -n "$aid" ]; then
@@ -425,18 +394,22 @@ let
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$qa_existing")
           if [ -n "$id" ]; then
             echo "multica-reconcile: updating quick action $name ($id)"
-            curl -fsS -X PATCH \
+            if ! curl -fsS -X PATCH \
               -H "Authorization: Bearer $MULTICA_TOKEN" \
               -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
               -H 'Content-Type: application/json' \
-              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions/$id" >/dev/null
+              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions/$id" >/dev/null 2>&1; then
+              echo "multica-reconcile: failed to update quick action $name" >&2
+            fi
           else
             echo "multica-reconcile: creating quick action $name"
-            curl -fsS -X POST \
+            if ! curl -fsS -X POST \
               -H "Authorization: Bearer $MULTICA_TOKEN" \
               -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
               -H 'Content-Type: application/json' \
-              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions" >/dev/null
+              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions" >/dev/null 2>&1; then
+              echo "multica-reconcile: failed to create quick action $name" >&2
+            fi
           fi
         done
       fi
@@ -494,53 +467,56 @@ let
             fi
           done
 
-          want_labels=$(jq -r '.triggers[].label' <<<"$ap")
-          while IFS=$'\t' read -r tid tlabel; do
-            [ -n "$tid" ] || continue
-            if printf '%s\n' "$want_labels" | grep -Fxq -- "$tlabel"; then continue; fi
-            echo "multica-reconcile: pruning autopilot $title trigger $tlabel ($tid)"
-            multica autopilot trigger-delete "$id" "$tid" >/dev/null \
-              || echo "multica-reconcile: prune of trigger $tlabel failed" >&2
-          done < <(jq -r '.[] | [.id, .label] | @tsv' <<<"$existing_triggers")
         done
       fi
 
-      prune_kind() {
-        local idfield="$1" live="$2" key="$3" delfn="$4"
-        local want
-        want=$(jq -r --arg k "$key" --arg f "$idfield" '.[$k][]? | .[$f]' "$manifest")
-        while IFS=$'\t' read -r rid ident; do
-          [ -n "$rid" ] || continue
-          if printf '%s\n' "$want" | grep -Fxq -- "$ident"; then continue; fi
-          echo "multica-reconcile: pruning $key '$ident' ($rid)"
-          "$delfn" "$rid" \
-            || echo "multica-reconcile: prune of $key '$ident' failed; will retry on next change" >&2
-        done < <(jq -r --arg f "$idfield" '.[] | [.id, .[$f]] | @tsv' <<<"$live")
-      }
+      # Provision per-sandbox authentication tokens. Each sandbox gets a unique real PAT
+      # (personal access token) that it reads from its own env file before starting the daemon.
+      # This runs after dev-mode login (so $MULTICA_TOKEN is a valid JWT) and creates
+      # sandbox tokens only once per rebuild, named sandbox-<name> to match the convention.
+      if [ -n "''${MULTICA_TOKEN:-}" ] && [ -n "''${MULTICA_SANDBOX_NAMES:-}" ]; then
+        echo "multica-reconcile: provisioning sandbox tokens for: $MULTICA_SANDBOX_NAMES"
+        for sandbox_name in $MULTICA_SANDBOX_NAMES; do
+          token_file="/var/lib/multica/secrets/sandbox-$sandbox_name.env"
+          token_id_marker="/var/lib/multica/secrets/.sandbox-$sandbox_name.id"
 
-      del_ap()    { multica autopilot delete "$1" >/dev/null; }
-      del_qa()    { curl -fsS -X DELETE \
-                      -H "Authorization: Bearer $MULTICA_TOKEN" \
-                      -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
-                      "$MULTICA_SERVER_URL/api/quick-actions/$1" >/dev/null; }
-      del_squad() { multica squad delete "$1" >/dev/null; }
-      del_agent() { multica agent archive "$1" >/dev/null; }
-      del_skill() { multica skill delete "$1" --yes >/dev/null; }
+          # Check if we already have a valid token for this sandbox (to avoid creating
+          # a new one on every rebuild, which would clutter the token list).
+          if [ -f "$token_file" ] && [ -f "$token_id_marker" ]; then
+            echo "multica-reconcile: sandbox $sandbox_name token already provisioned (skipping)."
+            continue
+          fi
 
-      live_aps=$(multica autopilot list --output json | jq '.autopilots // .')
-      live_qas=$(curl -fsS \
-        -H "Authorization: Bearer $MULTICA_TOKEN" \
-        -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
-        "$MULTICA_SERVER_URL/api/quick-actions" | jq '.quick_actions // []')
-      live_squads=$(multica squad list --output json)
-      live_agents=$(multica agent list --output json)
-      live_skills=$(multica skill list --output json)
+          echo "multica-reconcile: provisioning token for sandbox $sandbox_name"
 
-      prune_kind title "$live_aps"    autopilots   del_ap
-      prune_kind name  "$live_qas"    quickActions del_qa
-      prune_kind name  "$live_squads" squads       del_squad
-      prune_kind name  "$live_agents" agents       del_agent
-      prune_kind name  "$live_skills" skills       del_skill
+          # Create a real PAT via the backend's token API using the dev JWT.
+          # The response includes the full token string (only returned on creation, not on GET).
+          token_response=$(curl -fsS -X POST \
+            -H "Authorization: Bearer $MULTICA_TOKEN" \
+            -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"sandbox-$sandbox_name\"}" \
+            "''${MULTICA_SERVER_URL}/api/tokens")
+
+          token=$(jq -r '.token // empty' <<<"$token_response")
+          token_id=$(jq -r '.id // empty' <<<"$token_response")
+
+          if [ -z "$token" ] || [ -z "$token_id" ]; then
+            echo "multica-reconcile: failed to create token for sandbox $sandbox_name" >&2
+            echo "Response: $token_response" >&2
+            continue
+          fi
+
+          # Write the token to a file the sandbox container will read via environmentFile.
+          # Use mode 600 to match the security of the old shared token file.
+          printf 'MULTICA_TOKEN=%s\n' "$token" > "$token_file"
+          chmod 600 "$token_file"
+
+          # Mark this sandbox as provisioned so we don't create a new token on next rebuild.
+          echo "$token_id" > "$token_id_marker"
+          chmod 600 "$token_id_marker"
+        done
+      fi
 
       echo "multica-reconcile: reconcile complete"
     '';
@@ -554,6 +530,16 @@ in
       type = lib.types.bool;
       default = false;
       description = "Whether to put the Multica desktop client on PATH. Linux only.";
+    };
+
+    sandboxBackendHost = lib.mkOption {
+      type = lib.types.str;
+      example = "192.168.1.10";
+      description = ''
+        Host address the sandbox containers use to reach the backend. Sandboxes run on
+        Docker's bridge network, so this must be an address of the host that is reachable
+        from containers (e.g. its LAN IP) — not localhost. Required when `sandboxes` is set.
+      '';
     };
 
     backendImageFile = lib.mkOption {
@@ -590,9 +576,8 @@ in
       default = { };
       description = ''
         Declarative Multica skills. The attribute name is the skill's name (its
-        identity). The workspace is fully owned by this config: declared skills are
-        created or updated to match; skills not declared here are **deleted** from
-        the workspace on the next rebuild.
+        identity). Declared skills are created or updated to match on each rebuild;
+        deletion is left to the user.
 
         Reconciliation authenticates via passwordless dev-mode login (see
         `devLoginEmail`).
@@ -654,8 +639,10 @@ in
             type = lib.types.nullOr lib.types.str;
             default = null;
             description = ''
-              Runtime to run the agent on, by display name or id (see `multica runtime
-              list`). Null uses the sole runtime, and fails if there is more than one.
+              Runtime to run the agent on: a sandbox name from `sandboxes` (matched on the
+              daemon id that sandbox registers with), or a runtime display name / id from
+              `multica runtime list`. Null uses the sole runtime, and fails if there is more
+              than one.
             '';
           };
           model = lib.mkOption {
@@ -668,7 +655,28 @@ in
             default = [ ];
             description = ''
               Skill names to assign to this agent (from `skills` or already in the
-              workspace). The set is replaced to match on each reconcile.
+              workspace). Declared skills are added or updated; removal is manual.
+            '';
+          };
+          env = lib.mkOption {
+            type = lib.types.attrsOf lib.types.str;
+            default = { };
+            description = ''
+              Per-agent environment variables, reconciled into this agent's Multica
+              `custom_env` (visible and editable in the Multica desktop app under the
+              agent's settings) rather than baked into the sandbox container's OS
+              environment at container-start time. Multica injects `custom_env` into
+              the actual process environment of tasks the agent runs, so values are
+              live at runtime the same way container env vars were, but changes take
+              effect via reconcile (e.g. `make rebuild`) rather than requiring a
+              container restart. The reconciler merges these values into any existing
+              custom_env the agent already has (e.g. its `MULTICA_TOKEN`) rather than
+              replacing it outright; keys declared here always win over the same key
+              in the existing custom_env.
+
+              Values are read from the current shell environment via builtins.getEnv,
+              so use direnv or export variables before running `nix flake show` or `make rebuild`.
+              Example: { MY_VAR = builtins.getEnv "MY_VAR"; ANOTHER_VAR = "literal-value"; }
             '';
           };
         };
@@ -679,13 +687,10 @@ in
       default = { };
       description = ''
         Declarative Multica squads, reconciled after agents. The attribute name is the
-        squad's name. The workspace is fully owned by this config: declared squads are
-        created or updated; squads not declared here are **archived** on the next
-        rebuild. Members are replaced to match the declared set. The leader is
-        automatically a member — do not list it under `members`.
-
-        Note: archived squads cannot be restored via the CLI; re-declaring an archived
-        squad name creates a new squad with the same name.
+        squad's name. Declared squads are created or updated on each rebuild; squad
+        deletion and archival are left to the user. Members are added or updated to
+        match the declared set. The leader is automatically a member — do not list it
+        under `members`.
       '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
@@ -721,8 +726,8 @@ in
       description = ''
         Declarative Multica quick actions — named prompts that dispatch to an agent or
         squad. Reconciled after agents/squads (so they can reference ones you declare).
-        The workspace is fully owned by this config: declared actions are created or
-        updated; quick actions not declared here are **deleted** on the next rebuild.
+        Declared quick actions are created or updated on each rebuild; deletion is left
+        to the user.
 
         Quick actions have no CLI, so the reconciler drives the REST API directly.
       '';
@@ -749,9 +754,9 @@ in
       description = ''
         Declarative Multica autopilots — scheduled/triggered agent automations.
         Reconciled after agents/squads (so they can reference agents you declare).
-        The attribute name is the autopilot's title (its identity). The workspace is
-        fully owned by this config: declared autopilots are created or updated;
-        autopilots not declared here are **deleted** on the next rebuild.
+        The attribute name is the autopilot's title (its identity). Declared
+        autopilots are created or updated on each rebuild; deletion is left to the
+        user.
 
         Each autopilot dispatches to an assignee `agent`, which needs a runtime
         (registered by a running `multica daemon`). Without the agent present,
@@ -759,7 +764,7 @@ in
 
         Only schedule (cron) triggers are declarative here; webhook triggers are
         managed manually with `multica autopilot trigger-add`. Declared triggers are
-        upserted by label; triggers not declared are **deleted** (full ownership).
+        upserted by label; removal is manual.
       '';
       type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
         options = {
@@ -781,7 +786,7 @@ in
           triggers = lib.mkOption {
             description = ''
               Schedule (cron) triggers, keyed by label (the label is the identity).
-              Upserted on each reconcile; triggers not listed here are deleted.
+              Upserted on each reconcile; removal is manual.
             '';
             type = lib.types.attrsOf (lib.types.submodule {
               options = {
@@ -834,6 +839,22 @@ in
               to the oci-container's volumes list for persistent workspace storage.
             '';
           };
+          environmentFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            description = ''
+              Path to a file containing environment variables to pass to the sandbox container.
+              Used for secrets that should not be baked into the Nix store.
+            '';
+          };
+          environment = lib.mkOption {
+            type = lib.types.attrsOf lib.types.str;
+            default = {};
+            description = ''
+              Environment variables to pass to the sandbox container.
+              These are merged with any variables from environmentFile.
+            '';
+          };
         };
       });
     };
@@ -884,8 +905,7 @@ in
 
       virtualisation.oci-containers.backend = "docker";
 
-      virtualisation.oci-containers.containers =
-        {
+      virtualisation.oci-containers.containers = {
           multica-backend = {
             image = defaultBackendImage;
             imageFile = cfg.backendImageFile;
@@ -904,6 +924,7 @@ in
               "${multicaBackendEntrypoint}:/entrypoint-wrapper.sh:ro"
               "/var/lib/multica/secrets:/app/secrets"
               "/var/lib/multica/uploads:/app/data/uploads"
+              "tmp:/tmp"
             ];
             extraOptions = [ "--network=host" ];
           };
@@ -912,14 +933,18 @@ in
             lib.nameValuePair "multica-sandbox-${name}" {
               image = "multica-sandbox-${name}:latest";
               imageFile = mkSandboxImage name sandbox.extraPackages;
-              entrypoint = "${sandboxEntrypoint}/bin/multica-sandbox-entrypoint";
               environment = {
-                MULTICA_SERVER_URL = backendUrl;
+                MULTICA_SERVER_URL = sandboxBackendUrl;
                 MULTICA_DAEMON_DEVICE_NAME = name;
+                MULTICA_DAEMON_ID = "sandbox-${name}";
                 MULTICA_AGENT_RUNTIME_NAME = name;
-              };
-              volumes = sandbox.volumeMounts;
-              extraOptions = [ "--network=host" ];
+                IS_SANDBOX = "1";
+              } // sandbox.environment;
+              # MULTICA_TOKEN is provisioned per-sandbox by the reconcile script into
+              # /var/lib/multica/secrets/sandbox-<name>.env before sandboxes start.
+              environmentFiles = [ "/var/lib/multica/secrets/sandbox-${name}.env" ]
+                ++ lib.optional (sandbox.environmentFile != null) sandbox.environmentFile;
+              volumes = [ "tmp-${name}:/tmp" ] ++ sandbox.volumeMounts;
             }
           )
           cfg.sandboxes;
@@ -943,7 +968,10 @@ in
           Environment = [
             "HOME=%S/multica-reconcile"
             "MULTICA_SERVER_URL=${backendUrl}"
+            "MULTICA_SANDBOX_NAMES=${lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)}"
           ];
+          Restart = "on-failure";
+          RestartSec = 15;
         };
         script = "${lib.getExe reconcile} ${reconcileManifest}";
       };
@@ -952,8 +980,8 @@ in
       systemd.services = lib.mapAttrs'
         (name: _sandbox:
           lib.nameValuePair "docker-multica-sandbox-${name}" {
-            after = [ "docker-multica-backend.service" ];
-            requires = [ "docker-multica-backend.service" ];
+            after = [ "docker-multica-backend.service" "multica-reconcile.service" ];
+            requires = [ "docker-multica-backend.service" "multica-reconcile.service" ];
           }
         )
         cfg.sandboxes;

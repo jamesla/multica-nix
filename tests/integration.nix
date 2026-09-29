@@ -33,16 +33,11 @@ pkgs.testers.runNixOSTest {
       cores = 2;
     };
 
-    environment.etc."multica/secret.env".text = ''
-      JWT_SECRET=testsecret0123456789testsecret0123456789
-    '';
-
     services.multica = {
       enable = true;
 
       installDesktop = false;
 
-      environmentFile = "/etc/multica/secret.env";
       backendImageFile = backendImage;
 
       devLoginEmail = "admin@multica.local";
