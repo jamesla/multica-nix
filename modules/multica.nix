@@ -374,7 +374,7 @@ let
           desc=$(jq -r '.description' <<<"$qa")
           prompt=$(jq -r '.prompt' <<<"$qa")
           assignee=$(jq -r '.assignee' <<<"$qa")
-          vis="workspace"
+          vis="private"
 
           aid=$(jq -r --arg a "$assignee" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$qa_agents")
           if [ -n "$aid" ]; then
@@ -395,21 +395,25 @@ let
           id=$(jq -r --arg n "$name" 'map(select(.name == $n)) | (.[0].id // empty)' <<<"$qa_existing")
           if [ -n "$id" ]; then
             echo "multica-reconcile: updating quick action $name ($id)"
-            if ! curl -fsS -X PATCH \
+            resp=$(curl -sS -w '\n%{http_code}' -X PATCH \
               -H "Authorization: Bearer $MULTICA_TOKEN" \
               -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
               -H 'Content-Type: application/json' \
-              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions/$id" >/dev/null 2>&1; then
-              echo "multica-reconcile: failed to update quick action $name" >&2
+              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions/$id")
+            code=$(tail -n1 <<<"$resp")
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "multica-reconcile: failed to update quick action $name (HTTP $code): $(sed '$d' <<<"$resp")" >&2
             fi
           else
             echo "multica-reconcile: creating quick action $name"
-            if ! curl -fsS -X POST \
+            resp=$(curl -sS -w '\n%{http_code}' -X POST \
               -H "Authorization: Bearer $MULTICA_TOKEN" \
               -H "X-Workspace-Id: $MULTICA_WORKSPACE_ID" \
               -H 'Content-Type: application/json' \
-              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions" >/dev/null 2>&1; then
-              echo "multica-reconcile: failed to create quick action $name" >&2
+              -d "$body" "$MULTICA_SERVER_URL/api/quick-actions")
+            code=$(tail -n1 <<<"$resp")
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              echo "multica-reconcile: failed to create quick action $name (HTTP $code): $(sed '$d' <<<"$resp")" >&2
             fi
           fi
         done
@@ -965,7 +969,7 @@ in
       };
 
       systemd.services.multica-reconcile = {
-        description = "Reconcile declarative Multica resources (prunes undeclared ones)";
+        description = "Reconcile declarative Multica resources (create-or-update only)";
         after = [ "docker-multica-backend.service" ];
         requires = [ "docker-multica-backend.service" ];
         wantedBy = [ "multi-user.target" ];

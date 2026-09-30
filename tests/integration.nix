@@ -67,6 +67,12 @@ pkgs.testers.runNixOSTest {
         assignee = "reviewer";
       };
 
+      quickActions.summarize = {
+        description = "Summarize open issues";
+        prompt = "Summarize all open issues.";
+        assignee = "summarizer";
+      };
+
       autopilots.nightly = {
         description = "Summarise open issues each night.";
         agent = "reviewer";
@@ -133,9 +139,16 @@ pkgs.testers.runNixOSTest {
         "journalctl -u multica-reconcile.service "
         "| grep -q \"quick action triage assignee 'reviewer' not found\""
     )
+
+    # After agents are created, the summarizer quick action should reconcile successfully
+    # (both triage will still skip with "not found", but summarize should create)
+    machine.succeed(
+        "! journalctl -u multica-reconcile.service "
+        "| grep -q \"failed to create quick action summarize\""
+    )
     machine.succeed(
         "sudo -u postgres psql -d multica -tAc "
-        "\"select count(*) from quick_action\" | grep -q '^0$'"
+        "\"select count(*) from quick_action where name = 'summarize'\" | grep -q '^1$'"
     )
 
     machine.succeed(
