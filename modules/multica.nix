@@ -620,10 +620,8 @@ in
       default = { };
       description = ''
         Declarative Multica agents, reconciled into the workspace on rebuild (after
-        skills). The attribute name is the agent's name. The workspace is fully owned
-        by this config: declared agents are created or updated; agents not declared
-        here are **archived** from the workspace on the next rebuild. Archived agents
-        can be re-declared (they are restored rather than duplicated).
+        skills). The attribute name is the agent's name. Declared agents are created or
+        updated on rebuild; nothing undeclared is touched.
 
         Agents need a runtime, which is registered by a running `multica daemon` (not
         declarative). Reference one with `runtime`; if the workspace has exactly one,

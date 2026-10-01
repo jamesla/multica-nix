@@ -33,10 +33,11 @@ complete option reference with all available settings:
 services.multica = {
   # === REQUIRED ===
   enable = true;                                    # Turn the service on
-  environmentFile = "/var/lib/multica/env";        # Env file (KEY=VALUE) with MULTICA_TOKEN, etc.
 
-  # === CORE SETTINGS ===
-  installDesktop = true;                           # Put desktop app on PATH (Linux only)
+  # === CORE SETTINGS (with defaults) ===
+  environmentFile = "/var/lib/multica/env";        # Env file with MULTICA_TOKEN, etc. (default path shown; must exist)
+
+  installDesktop = false;                          # Put desktop app on PATH (Linux only)
 
   # Postgres (local, pgvector) is always provisioned; the backend runs in dev mode
   # on localhost:8080. These are fixed and not configurable.
@@ -72,13 +73,13 @@ services.multica = {
       model = "claude-opus-5";                         # Model ID; null = runtime default
       thinking = "low";                                # Reasoning level (low|medium|high|xhigh|max)
       skills = [ "example-skill" ];                    # Skill names to assign
+      # env = { CUSTOM_VAR = "value"; };               # Optional custom env vars (merged with sandbox env)
     };
   };
 
   # === DECLARATIVE SQUADS ===
-  # Fully owned by config: declared squads created/updated, undeclared squads archived on rebuild.
+  # Declared squads are created or updated on rebuild; nothing undeclared is touched.
   # Members replaced to match declared set. Leader auto-added as member — do not list under members.
-  # Archived squads cannot be restored via CLI; re-declaring creates a new squad.
   squads = {
     example-squad = {
       description = "Example squad";
@@ -91,22 +92,27 @@ services.multica = {
     };
   };
 
+  # === CORE SETTINGS (Sandboxes) ===
+  sandboxBackendHost = "host.docker.internal";    # Host address for sandboxes to reach backend (required if sandboxes are used)
+
   # === DECLARATIVE SANDBOXES ===
   # OCI containers running multica daemon, each auto-registering as a runtime.
   # Agents reference a sandbox by name via their runtime field. Provides process/filesystem
-  # isolation; containers use Docker bridge networking and reach the backend via host.docker.internal.
+  # isolation; containers use Docker bridge networking and reach the backend via sandboxBackendHost.
   sandboxes = {
     my-sandbox = {
       extraPackages = [ ];                         # Extra packages for this sandbox
       # extraPackages = [ pkgs.ripgrep pkgs.gh ];
       volumeMounts = [ ];                          # Docker-style bind mounts ("host:container" or "host:container:ro")
       # volumeMounts = [ "/var/lib/work:/app/workspace" "/home/shared:/app/shared:ro" ];
+      # environment = { CUSTOM_VAR = "value"; };    # Optional env vars for this sandbox
+      # environmentFile = "/var/lib/sandbox-env";   # Optional env file for this sandbox (merged with environment)
     };
   };
 
   # === DECLARATIVE QUICK ACTIONS ===
-  # Named prompts dispatching to an agent or squad. Fully owned: declared created/updated,
-  # undeclared deleted on rebuild. Reconciled after agents/squads.
+  # Named prompts dispatching to an agent or squad. Declared actions are created or updated
+  # on rebuild; nothing undeclared is touched. Reconciled after agents/squads.
   quickActions = {
     example-action = {
       description = "Example action";
@@ -117,19 +123,19 @@ services.multica = {
 
   # === DECLARATIVE AUTOPILOTS ===
   # Scheduled/triggered agent automations. Attribute name is title (identity).
-  # Fully owned: declared created/updated, undeclared deleted on rebuild.
+  # Declared autopilots are created or updated on rebuild; nothing undeclared is touched.
   # Reconciled after agents/squads. Only cron triggers declarative here; webhook triggers
-  # managed manually (multica autopilot trigger-add). Triggers upserted by label; undeclared deleted.
+  # managed manually (multica autopilot trigger-add). Triggers upserted by label.
   autopilots = {
     "Example Autopilot" = {
       description = "Example autopilot";           # Used as run prompt
       agent = "example-agent";                    # Agent name/id
-      mode = "run_only";                          # "run_only" (default) or "create_issue"
+      mode = "run_only";                          # "run_only" or "create_issue"
       triggers = {
         example = {
-          cron = "0 9 * * *";                     # Cron expression
-          # timezone = "UTC";                     # IANA timezone (default: UTC)
-          # enabled = true;                       # Whether trigger is enabled (default: true)
+          cron = "0 9 * * *";                     # Cron expression (required)
+          timezone = "UTC";                       # IANA timezone (required)
+          enabled = true;                         # Whether trigger is enabled (required)
         };
       };
     };
