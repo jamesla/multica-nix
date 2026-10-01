@@ -266,8 +266,8 @@ let
             exit 1
           fi
           if [ -z "$rtid" ]; then
-            echo "multica-reconcile: agent $name runtime '$rt' not found." >&2
-            exit 1
+            echo "multica-reconcile: agent $name runtime '$rt' not found (sandbox starting?); skipping until next reconcile." >&2
+            continue
           fi
 
           args=(--visibility workspace)
