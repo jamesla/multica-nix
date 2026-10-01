@@ -344,8 +344,8 @@ let
             mrole=$(jq -r '.role' <<<"$m")
             maid=$(jq -r --arg a "$magent" 'map(select(.name == $a or .id == $a)) | (.[0].id // empty)' <<<"$existing_agents")
             if [ -z "$maid" ]; then
-              echo "multica-reconcile: squad $name member '$magent' not found." >&2
-              exit 1
+              echo "multica-reconcile: squad $name member '$magent' not found (sandbox starting?); skipping until next reconcile." >&2
+              continue
             fi
             [ "$maid" = "$leader_id" ] && continue
             cur_role=$(jq -r --arg id "$maid" 'map(select(.member_id == $id)) | (.[0].role // empty)' <<<"$current")
