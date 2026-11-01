@@ -980,7 +980,7 @@ in
           Environment = [
             "HOME=%S/multica-reconcile"
             "MULTICA_SERVER_URL=${backendUrl}"
-            ("MULTICA_SANDBOX_NAMES=\"" + (lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)) + "\"")
+            "MULTICA_SANDBOX_NAMES=${lib.escapeShellArg (lib.concatStringsSep " " (lib.attrNames cfg.sandboxes))}"
           ];
           Restart = "on-failure";
           RestartSec = 15;
