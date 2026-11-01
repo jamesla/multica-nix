@@ -972,6 +972,9 @@ in
         requires = [ "docker-multica-backend.service" ];
         wantedBy = [ "multi-user.target" ];
         restartTriggers = [ reconcileManifest ];
+        environment = {
+          MULTICA_SANDBOX_NAMES = lib.concatStringsSep " " (lib.attrNames cfg.sandboxes);
+        };
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -980,7 +983,6 @@ in
           Environment = [
             "HOME=%S/multica-reconcile"
             "MULTICA_SERVER_URL=${backendUrl}"
-            "MULTICA_SANDBOX_NAMES=${lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)}"
           ];
           Restart = "on-failure";
           RestartSec = 15;
