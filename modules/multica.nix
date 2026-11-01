@@ -973,8 +973,7 @@ in
         wantedBy = [ "multi-user.target" ];
         restartTriggers = [ reconcileManifest ];
         script = ''
-          export MULTICA_SANDBOX_NAMES="${lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)}"
-          ${lib.getExe reconcile} ${reconcileManifest}
+          MULTICA_SANDBOX_NAMES='${lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)}' exec ${lib.getExe reconcile} ${reconcileManifest}
         '';
         serviceConfig = {
           Type = "oneshot";
