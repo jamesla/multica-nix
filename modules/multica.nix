@@ -980,14 +980,12 @@ in
           Environment = [
             "HOME=%S/multica-reconcile"
             "MULTICA_SERVER_URL=${backendUrl}"
-            "MULTICA_SANDBOX_NAMES=${lib.concatStringsSep " " (lib.attrNames cfg.sandboxes)}"
+            "MULTICA_SANDBOX_NAMES=${lib.escapeShellArg (lib.concatStringsSep " " (lib.attrNames cfg.sandboxes))}"
           ];
-          ExecStart = ''
-            bash -c 'exec ${lib.getExe reconcile} ${reconcileManifest}'
-          '';
           Restart = "on-failure";
           RestartSec = 15;
         };
+        script = "${lib.getExe reconcile} ${reconcileManifest}";
       };
     }
     (lib.mkIf (cfg.sandboxes != { }) {
